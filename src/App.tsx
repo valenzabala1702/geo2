@@ -13,6 +13,7 @@ interface CsvRow {
   account_uuid: string;
   kw: string;  // Keywords separadas por comas
   task_count: number;  // Número de artículos a generar
+  task_clickup_ids: string;  // IDs de ClickUp separados por comas
 }
 
 // 🔧 Normaliza cualquier imagen base64 a 1536×864 usando canvas
@@ -397,6 +398,7 @@ const App: React.FC = () => {
     totalArticles: number;
     publishedUrls: string[];
     isComplete: boolean;
+    currentAccountUuid?: string; // UUID de la cuenta actual
   }>({
     currentAccount: 0,
     totalAccounts: 0,
@@ -408,11 +410,161 @@ const App: React.FC = () => {
 
   const [clientWebsite, setClientWebsite] = useState<string | null>(null);
 
+  // 🧠 Memoria de títulos generados por cuenta (para evitar duplicados)
+  const [accountMemory, setAccountMemory] = useState<Record<string, string[]>>({});
+
+  // 📋 Capturar URLs publicadas automáticamente en modo CSV
+  React.useEffect(() => {
+    // Solo en modo CSV y si la publicación fue exitosa
+    if (batchProgress.totalAccounts > 0 && publishResult?.success && publishResult.url) {
+      // Verificar si la URL ya está en el array (evitar duplicados)
+      if (!batchProgress.publishedUrls.includes(publishResult.url)) {
+        setBatchProgress(prev => ({
+          ...prev,
+          publishedUrls: [...prev.publishedUrls, publishResult.url!]
+        }));
+        addLog(`✅ URL guardada en resumen: ${publishResult.url}`);
+      }
+    }
+  }, [publishResult]); // Se ejecuta cada vez que publishResult cambia
+
   const addLog = (msg: string) => {
     setLogs(prev => [...prev.slice(-25), `[${new Date().toLocaleTimeString()}] ${msg}`]);
   };
 
   const wait = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+  // 🔗 Actualizar campo de URL en ClickUp
+  const updateClickUpTaskUrl = async (taskId: string, url: string): Promise<boolean> => {
+    try {
+      addLog(`🔄 Actualizando ClickUp task ${taskId} con URL...`);
+      
+      const response = await fetch(`https://api.clickup.com/api/v2/task/${taskId}/field/959a5bb5-b1ac-44ec-b814-52f7b415ac91`, {
+        method: 'POST',
+        headers: {
+          'accept': 'application/json',
+          'content-type': 'application/json',
+          'Authorization': 'pk_88229489_VXTU9J94MUYGDPXQ80XHST6KY6FIK1XH'
+        },
+        body: JSON.stringify({ value: url })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Error ${response.status}: ${await response.text()}`);
+      }
+
+      addLog(`✅ URL poblada en ClickUp task ${taskId}`);
+      return true;
+    } catch (e: any) {
+      addLog(`❌ Error poblando URL en ClickUp: ${e.message}`);
+      return false;
+    }
+  };
+
+  // ✅ Marcar tarea de ClickUp como completada
+  const markClickUpTaskComplete = async (taskId: string): Promise<boolean> => {
+    try {
+      addLog(`🔄 Marcando ClickUp task ${taskId} como completada...`);
+      
+      const response = await fetch(`https://api.clickup.com/api/v2/task/${taskId}/field/b39da2a6-e438-4786-aaa6-9774e49bfcc4?custom_task_ids=true`, {
+        method: 'POST',
+        headers: {
+          'accept': 'application/json',
+          'content-type': 'application/json',
+          'Authorization': 'pk_88229489_VXTU9J94MUYGDPXQ80XHST6KY6FIK1XH'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Error ${response.status}: ${await response.text()}`);
+      }
+
+      addLog(`✅ ClickUp task ${taskId} marcada como completada`);
+      return true;
+    } catch (e: any) {
+      addLog(`❌ Error marcando tarea: ${e.message}`);
+      return false;
+    }
+  };
+
+  // 📋 Actualizar todas las tareas de ClickUp con las URLs generadas
+  const updateClickUpTasks = async () => {
+    if (csvRows.length === 0 || batchProgress.publishedUrls.length === 0) {
+      addLog("❌ No hay URLs o filas CSV para actualizar");
+      return;
+    }
+
+    addLog(`\n========================================`);
+    addLog(`📋 ACTUALIZANDO CLICKUP`);
+    addLog(`========================================`);
+
+    setIsLoading(true);
+    setLoadingStatus("Actualizando tareas en ClickUp...");
+
+    let urlIndex = 0;
+    let successCount = 0;
+
+    try {
+      for (const row of csvRows) {
+        // Parsear los task IDs de ClickUp
+        const taskIds = row.task_clickup_ids
+          .split(',')
+          .map(id => id.trim())
+          .filter(id => id.length > 0);
+
+        if (taskIds.length === 0) {
+          addLog(`⚠️ No hay task IDs para cuenta ${row.account_uuid.slice(0, 12)}...`);
+          continue;
+        }
+
+        addLog(`\n📦 Procesando ${taskIds.length} tareas de ClickUp...`);
+
+        // Actualizar cada task con su URL correspondiente
+        for (let i = 0; i < taskIds.length; i++) {
+          if (urlIndex >= batchProgress.publishedUrls.length) {
+            addLog(`⚠️ No hay más URLs disponibles`);
+            break;
+          }
+
+          const taskId = taskIds[i];
+          const url = batchProgress.publishedUrls[urlIndex];
+
+          addLog(`\n🎯 Task ${i + 1}/${taskIds.length}: ${taskId}`);
+
+          // 1. Poblar URL
+          const urlSuccess = await updateClickUpTaskUrl(taskId, url);
+          await wait(500);
+
+          if (urlSuccess) {
+            // 2. Marcar como completada
+            const completeSuccess = await markClickUpTaskComplete(taskId);
+            await wait(500);
+
+            if (completeSuccess) {
+              successCount++;
+            }
+          }
+
+          urlIndex++;
+        }
+      }
+
+      addLog(`\n========================================`);
+      addLog(`✅ ACTUALIZACIÓN COMPLETADA`);
+      addLog(`========================================`);
+      addLog(`📊 ${successCount} tareas actualizadas exitosamente`);
+
+      // Mostrar mensaje de éxito
+      alert(`✅ ClickUp actualizado:\n\n${successCount} tareas actualizadas correctamente`);
+
+    } catch (e: any) {
+      addLog(`❌ Error general: ${e.message}`);
+      alert(`Error actualizando ClickUp:\n\n${e.message}`);
+    } finally {
+      setIsLoading(false);
+      setLoadingStatus("");
+    }
+  };
 
   // 📄 Parser CSV robusto que maneja valores con comas entre comillas
   const parseCSVLine = (line: string): string[] => {
@@ -460,7 +612,7 @@ const App: React.FC = () => {
     addLog(`📋 Columnas detectadas: ${headers.join(", ")}`);
     
     // Verificar que existan las columnas requeridas
-    const requiredColumns = ['account_uuid', 'kw', 'task_count'];
+    const requiredColumns = ['account_uuid', 'kw', 'task_count', 'task_clickup_ids'];
     const missingColumns = requiredColumns.filter(col => !headers.includes(col));
     
     if (missingColumns.length > 0) {
@@ -476,11 +628,13 @@ const App: React.FC = () => {
       const kw = values[headers.indexOf("kw")] || "";
       const taskCountStr = values[headers.indexOf("task_count")] || "1";
       const taskCount = parseInt(taskCountStr, 10);
+      const taskClickupIds = values[headers.indexOf("task_clickup_ids")] || "";
 
       return {
         account_uuid: accountUuid,
         kw: kw,
         task_count: isNaN(taskCount) || taskCount <= 0 ? 1 : taskCount,
+        task_clickup_ids: taskClickupIds,
       };
     }).filter(row => row.account_uuid && row.kw);
 
@@ -653,9 +807,11 @@ const App: React.FC = () => {
     return String(data).slice(0, 5000);
   };
 
-  const handleDataAcquisition = async (data: any, skipKeywordsAndStep: boolean = false) => {
+  const handleDataAcquisition = async (data: any, skipKeywordsAndStep: boolean = false): Promise<string | null> => {
     addLog("Interpretando información del Brief...");
     const context = extractContextFromData(data);
+
+    let detectedWebsite: string | null = null;
 
     // 🌐 DETECCIÓN DE WEB DEL CLIENTE (solo si el brief es HTML)
     if (typeof data === "string") {
@@ -663,6 +819,7 @@ const App: React.FC = () => {
 
       if (website) {
         setClientWebsite(website);
+        detectedWebsite = website;
         addLog(`🌐 Web del cliente detectada: ${website}`);
       } else {
         setClientWebsite(null);
@@ -690,6 +847,8 @@ const App: React.FC = () => {
         setIsLoading(false);
       }
     }
+
+    return detectedWebsite;
   };
  
   // 🔑 FUNCIÓN BASE reutilizable (UI + CSV)
@@ -772,14 +931,31 @@ const App: React.FC = () => {
       addLog("📐 Outline recibido desde Gemini:");
       addLog(JSON.stringify(outline, null, 2));
 
-      if (!outline || !Array.isArray(outline.sections) || outline.sections.length === 0) {
-        addLog("⚠️ Gemini no devolvió secciones H2. Generando fallback automático.");
+      // 🔍 VERIFICAR si Gemini devolvió secciones con títulos válidos
+      const hasValidSections = outline && 
+                              Array.isArray(outline.sections) && 
+                              outline.sections.length > 0 &&
+                              outline.sections.every(s => s.title && s.title.trim().length > 0);
 
-        const fallbackSections = keywords.slice(0, 4).map((kw, i) => ({
-          id: `section-${i + 1}`,
-          title: kw,
-          content: ''
-        }));
+      if (!hasValidSections) {
+        addLog("⚠️ Gemini no devolvió secciones válidas. Generando fallback inteligente...");
+
+        // 📝 FALLBACK INTELIGENTE: Generar títulos H2 basados en keywords
+        const sectionTemplates = [
+          { prefix: "¿Qué es", suffix: "?" },
+          { prefix: "Beneficios de", suffix: "" },
+          { prefix: "Cómo funciona", suffix: "" },
+          { prefix: "Tipos de", suffix: "" },
+        ];
+        
+        const fallbackSections = keywords.slice(0, 4).map((kw, i) => {
+          const template = sectionTemplates[i] || { prefix: "Todo sobre", suffix: "" };
+          return {
+            id: `section-${i + 1}`,
+            title: `${template.prefix} ${kw}${template.suffix}`,
+            content: ''
+          };
+        });
 
         setArticle(prev => ({
           ...prev,
@@ -787,12 +963,16 @@ const App: React.FC = () => {
           sections: fallbackSections,
           primaryKeywords: keywords
         }));
+        
+        addLog(`✅ Fallback generado con ${fallbackSections.length} secciones`);
       } else {
         setArticle(prev => ({
           ...prev,
           ...outline,
           primaryKeywords: keywords
         }));
+        
+        addLog(`✅ Outline de Gemini: ${outline.sections?.length} secciones`);
       }
 
       setStep(AppStep.OUTLINE);
@@ -804,7 +984,7 @@ const App: React.FC = () => {
     }
   };
 
-  const startWriting = async () => {
+  const startWriting = async (): Promise<Partial<Article>> => {
     setIsLoading(true);
 
     try {
@@ -883,9 +1063,6 @@ const App: React.FC = () => {
         addLog("ℹ️ El cliente no tiene sitio web registrado.");
         addLog("✓ El artículo se publicará sin enlaces internos.");
       }
-
-      // 3️⃣ ACTUALIZAR STATE
-      setArticle(prev => ({ ...prev, sections: finalSections }));
 
       // 4️⃣ GENERACIÓN DE IMAGEN (OBLIGATORIA)
       setLoadingStatus("Generando imagen editorial con IA...");
@@ -974,15 +1151,17 @@ Generate only the image.`;
         );
       }
 
-      setArticle(prev => ({
-        ...prev,
+      // 5️⃣ CONSTRUIR ARTÍCULO COMPLETO
+      const completeArticle: Partial<Article> = {
+        ...article,
+        sections: finalSections,
         featuredImage: {
           prompt: imagePrompt,
           size: "1536x864",
           altText: `${article.title} - ${keywords[0]}`,
           base64: imageBase64,
         },
-      }));
+      };
 
       addLog("✓ Imagen editorial final aceptada.");
       
@@ -992,12 +1171,18 @@ Generate only the image.`;
         addLog(`✅ Artículo completo: imagen 1536×864 + legibilidad optimizada (sin enlaces internos)`);
       }
 
+      // 6️⃣ ACTUALIZAR STATE (para UI)
+      setArticle(completeArticle);
       setStep(AppStep.WRITING);
+
+      // 7️⃣ RETORNAR EL ARTÍCULO COMPLETO
+      return completeArticle;
 
     } catch (e: any) {
       console.error("❌ Error crítico en startWriting:", e);
       addLog(`❌ Error crítico: ${e.message}`);
       alert(`Proceso detenido:\n\n${e.message}`);
+      throw e;
     } finally {
       setIsLoading(false);
       setLoadingStatus("");
@@ -1096,26 +1281,141 @@ Generate only the image.`;
   const proceedToOutlineCSV = async (kws: string[]): Promise<any> => {
     if (kws.length === 0) throw new Error("No hay keywords");
     
-    const outline = await generateArticleOutline(kws[0], kws, 'on-page');
+    const articleNumber = batchProgress.currentArticle || 1;
+    const accountUuid = batchProgress.currentAccountUuid;
+    
+    // 🧠 Obtener títulos previos de esta cuenta
+    const previousTitles = accountUuid ? (accountMemory[accountUuid] || []) : [];
+    
+    addLog(`🧠 Verificando memoria: ${previousTitles.length} títulos previos en esta cuenta`);
+    
+    // 🎲 Agregar variación al prompt según el artículo actual
+    const variationPrompts = [
+      "on-page", // Artículo 1: enfoque estándar
+      "comprehensive-guide", // Artículo 2: guía completa
+      "quick-tips", // Artículo 3: tips rápidos
+      "deep-dive", // Artículo 4+: análisis profundo
+    ];
+    
+    const contentType = variationPrompts[Math.min(articleNumber - 1, variationPrompts.length - 1)];
+    
+    addLog(`🎨 Generando artículo tipo: ${contentType} (variación ${articleNumber})`);
+    
+    const outline = await generateArticleOutline(kws[0], kws, contentType as ContentType);
 
     let articleData;
-    if (!outline || !Array.isArray(outline.sections) || outline.sections.length === 0) {
-      const fallbackSections = kws.slice(0, 4).map((kw, i) => ({
-        id: `section-${i + 1}`,
-        title: kw,
-        content: ''
-      }));
+    
+    // 🔍 VERIFICAR si Gemini devolvió secciones con títulos válidos
+    const hasValidSections = outline && 
+                            Array.isArray(outline.sections) && 
+                            outline.sections.length > 0 &&
+                            outline.sections.every(s => s.title && s.title.trim().length > 0);
+    
+    if (!hasValidSections) {
+      addLog("⚠️ Gemini no devolvió secciones válidas. Generando fallback inteligente...");
+      
+      // 📝 FALLBACK INTELIGENTE: Generar títulos H2 basados en keywords
+      const sectionTemplates = [
+        { prefix: "¿Qué es", suffix: "?" },
+        { prefix: "Beneficios de", suffix: "" },
+        { prefix: "Cómo funciona", suffix: "" },
+        { prefix: "Tipos de", suffix: "" },
+        { prefix: "Guía completa sobre", suffix: "" },
+      ];
+      
+      const fallbackSections = kws.slice(0, 4).map((kw, i) => {
+        const template = sectionTemplates[i] || { prefix: "Todo sobre", suffix: "" };
+        return {
+          id: `section-${i + 1}`,
+          title: `${template.prefix} ${kw}${template.suffix}`,
+          content: ''
+        };
+      });
+
+      // Generar título variado según el número de artículo y asegurarse de que sea diferente
+      const titleVariations = [
+        `Guía completa sobre ${kws[0]}`,
+        `${kws[0]}: Todo lo que necesitas saber`,
+        `Descubre ${kws[0]}: Guía práctica`,
+        `${kws[0]} explicado: Información esencial`,
+        `Conoce todo sobre ${kws[0]}`,
+        `${kws[0]}: Guía definitiva`,
+      ];
+      
+      // 🧠 Buscar un título que no esté en la memoria
+      let selectedTitle = outline?.title;
+      
+      if (!selectedTitle || previousTitles.includes(selectedTitle)) {
+        for (const variation of titleVariations) {
+          if (!previousTitles.includes(variation)) {
+            selectedTitle = variation;
+            break;
+          }
+        }
+        
+        // Si todos los títulos ya existen, agregar número
+        if (previousTitles.includes(selectedTitle || '')) {
+          selectedTitle = `${titleVariations[articleNumber - 1]} (${articleNumber})`;
+        }
+      }
 
       articleData = {
-        title: outline?.title || `Guía completa sobre ${kws[0]}`,
+        title: selectedTitle,
         sections: fallbackSections,
         primaryKeywords: kws
       };
+      
+      addLog(`✅ Fallback generado: ${articleData.title}`);
+      addLog(`✅ Secciones: ${fallbackSections.map(s => s.title).join(', ')}`);
     } else {
+      // ✅ Gemini devolvió estructura válida
+      let finalTitle = outline.title;
+      
+      // 🧠 Verificar si el título ya existe en la memoria
+      if (previousTitles.includes(finalTitle)) {
+        addLog(`⚠️ Título duplicado detectado: "${finalTitle}"`);
+        
+        // Agregar variación al título
+        const titleSuffixes = [
+          ": Guía completa",
+          ": Todo lo que debes saber",
+          ": Información esencial",
+          ": Aspectos clave",
+          " en detalle",
+        ];
+        
+        for (const suffix of titleSuffixes) {
+          const newTitle = `${finalTitle}${suffix}`;
+          if (!previousTitles.includes(newTitle)) {
+            finalTitle = newTitle;
+            addLog(`✅ Título modificado para evitar duplicado: "${finalTitle}"`);
+            break;
+          }
+        }
+        
+        // Si aún así existe, agregar número
+        if (previousTitles.includes(finalTitle)) {
+          finalTitle = `${outline.title} (${articleNumber})`;
+          addLog(`✅ Título con número: "${finalTitle}"`);
+        }
+      }
+      
       articleData = {
         ...outline,
+        title: finalTitle,
         primaryKeywords: kws
       };
+      
+      addLog(`✅ Outline de Gemini: ${articleData.sections?.length} secciones`);
+    }
+    
+    // 🧠 GUARDAR el título en la memoria
+    if (accountUuid && articleData.title) {
+      setAccountMemory(prev => ({
+        ...prev,
+        [accountUuid]: [...(prev[accountUuid] || []), articleData.title!]
+      }));
+      addLog(`🧠 Título guardado en memoria: "${articleData.title}"`);
     }
     
     setArticle(articleData);
@@ -1138,17 +1438,29 @@ Generate only the image.`;
         totalArticles: row.task_count
       }));
 
-      // 1️⃣ Obtener brief
+      // 1️⃣ Obtener brief UNA SOLA VEZ por cuenta
+      addLog(`📥 Obteniendo brief para cuenta ${accountIndex + 1}...`);
       const rawText = await fetchBriefByUuid(row.account_uuid);
       
+      let detectedWebsite: string | null = null;
+      
       if (rawText.toLowerCase().includes("<!doctype html") || rawText.includes("<html")) {
-        await handleDataAcquisition(rawText, true);
+        detectedWebsite = await handleDataAcquisition(rawText, true);
       } else {
         const data = JSON.parse(rawText);
-        await handleDataAcquisition(data, true);
+        detectedWebsite = await handleDataAcquisition(data, true);
+      }
+      
+      // Guardar el website detectado para esta cuenta
+      if (detectedWebsite) {
+        setClientWebsite(detectedWebsite);
+        addLog(`✅ Website para esta cuenta: ${detectedWebsite}`);
+      } else {
+        setClientWebsite(null);
+        addLog(`ℹ️ Esta cuenta no tiene website`);
       }
 
-      // 2️⃣ Preparar keywords (máximo 5)
+      // 2️⃣ Preparar keywords (máximo 5) UNA SOLA VEZ
       let keywordsText = row.kw.trim();
       if (keywordsText.startsWith('[') && keywordsText.endsWith(']')) {
         keywordsText = keywordsText.slice(1, -1);
@@ -1159,50 +1471,79 @@ Generate only the image.`;
       
       const keywordsToUse = allKeywords.slice(0, 5);
       setKeywords(keywordsToUse);
+      addLog(`🔑 Keywords configuradas: ${keywordsToUse.join(", ")}`);
       await wait(500);
 
-      // 3️⃣ Generar artículos UNO POR UNO
+      // 3️⃣ Generar N artículos para esta cuenta
+      addLog(`📊 Generando ${row.task_count} artículos para esta cuenta...`);
+      
       for (let i = 0; i < row.task_count; i++) {
+        addLog(`\n========================================`);
+        addLog(`📝 ARTÍCULO ${i + 1}/${row.task_count}`);
+        addLog(`========================================`);
+        
         // Actualizar progreso
         setBatchProgress(prev => ({
           ...prev,
           currentArticle: i + 1
         }));
 
-        // Generar outline
+        // PASO 1: Generar estructura (outline)
+        addLog(`🏗️ Paso 1/3: Generando estructura...`);
         await proceedToOutlineCSV(keywordsToUse);
         await wait(1000);
         
-        // Escribir contenido
-        await startWriting();
-        await wait(2000);
+        // PASO 2: Escribir contenido completo (incluye imagen)
+        addLog(`✍️ Paso 2/3: Redactando contenido completo...`);
+        const completeArticle = await startWriting();
         
-        // Publicar
+        // 🔍 VERIFICAR que el artículo tiene contenido
+        if (!completeArticle.sections || completeArticle.sections.length === 0) {
+          throw new Error("El artículo no tiene secciones después de startWriting");
+        }
+        
+        addLog(`✅ Artículo con ${completeArticle.sections.length} secciones listo para publicar`);
+        
+        // PASO 3: Publicar en WordPress
+        addLog(`📤 Paso 3/3: Publicando en WordPress...`);
+        
+        // Temporalmente actualizar el estado article para que publish() lo use
+        setArticle(completeArticle);
+        await wait(500);
+        
         await publish();
         
         // Capturar URL
-        await wait(500);
+        await wait(1000);
         if (publishResult?.success && publishResult.url) {
           publishedUrls.push(publishResult.url);
+          addLog(`✅ Artículo ${i + 1} publicado: ${publishResult.url}`);
           
           setBatchProgress(prev => ({
             ...prev,
             publishedUrls: [...prev.publishedUrls, publishResult.url!]
           }));
+        } else {
+          addLog(`⚠️ Artículo ${i + 1} no se pudo publicar`);
         }
         
-        if (i < row.task_count - 1) await wait(2000);
+        // Esperar entre artículos (excepto el último)
+        if (i < row.task_count - 1) {
+          addLog(`⏳ Esperando 3s antes del siguiente artículo...`);
+          await wait(3000);
+        }
       }
 
+      addLog(`\n✅ Cuenta ${accountIndex + 1} completada: ${publishedUrls.length}/${row.task_count} artículos publicados`);
       return publishedUrls;
 
     } catch (e: any) {
-      addLog(`❌ Error en cuenta: ${e.message}`);
+      addLog(`❌ Error en cuenta ${accountIndex + 1}: ${e.message}`);
       throw e;
     }
   };
 
-  // 🏭 Inicia la producción masiva desde CSV
+  // 🏭 Inicia la producción masiva desde CSV (modo semi-automático)
   const startBatchProduction = async () => {
     if (csvRows.length === 0) {
       alert("No hay filas CSV cargadas");
@@ -1219,32 +1560,149 @@ Generate only the image.`;
       isComplete: false
     });
 
-    setIsLoading(true);
+    // Cargar primera cuenta
+    await loadNextCsvAccount();
+  };
 
-    try {
-      for (let i = 0; i < csvRows.length; i++) {
-        await processCsvRow(csvRows[i], i, csvRows.length);
-        
-        if (i < csvRows.length - 1) {
-          await wait(3000);
-        }
-      }
-
-      // Marcar como completado
+  // 📥 Cargar la siguiente cuenta del CSV
+  const loadNextCsvAccount = async () => {
+    const currentIndex = batchProgress.currentAccount;
+    
+    if (currentIndex >= csvRows.length) {
+      // Todas las cuentas procesadas
       setBatchProgress(prev => ({
         ...prev,
         isComplete: true
       }));
+      return;
+    }
 
-    } catch (e: any) {
-      alert(`Error en producción:\n\n${e.message}`);
+    const row = csvRows[currentIndex];
+    
+    setIsLoading(true);
+    addLog(`\n========================================`);
+    addLog(`📂 CUENTA ${currentIndex + 1}/${csvRows.length}`);
+    addLog(`========================================`);
+
+    try {
+      // 1️⃣ Obtener brief
+      addLog(`📥 Obteniendo brief...`);
+      const rawText = await fetchBriefByUuid(row.account_uuid);
+      
+      let detectedWebsite: string | null = null;
+      
+      if (rawText.toLowerCase().includes("<!doctype html") || rawText.includes("<html")) {
+        detectedWebsite = await handleDataAcquisition(rawText, true);
+      } else {
+        const data = JSON.parse(rawText);
+        detectedWebsite = await handleDataAcquisition(data, true);
+      }
+      
+      if (detectedWebsite) {
+        setClientWebsite(detectedWebsite);
+        addLog(`✅ Website detectado: ${detectedWebsite}`);
+      } else {
+        setClientWebsite(null);
+        addLog(`ℹ️ Sin website`);
+      }
+
+      // 2️⃣ Preparar keywords
+      let keywordsText = row.kw.trim();
+      if (keywordsText.startsWith('[') && keywordsText.endsWith(']')) {
+        keywordsText = keywordsText.slice(1, -1);
+      }
+      
+      const allKeywords = keywordsText.split(",").map(k => k.trim()).filter(k => k.length > 0);
+      if (allKeywords.length === 0) throw new Error("No hay keywords válidas");
+      
+      const keywordsToUse = allKeywords.slice(0, 5);
+      setKeywords(keywordsToUse);
+      addLog(`🔑 Keywords: ${keywordsToUse.join(", ")}`);
+
+      // 3️⃣ Actualizar progreso
       setBatchProgress(prev => ({
         ...prev,
-        isComplete: false
+        currentAccount: currentIndex + 1,
+        currentArticle: 0,
+        totalArticles: row.task_count,
+        currentAccountUuid: row.account_uuid // ← Guardar UUID actual
       }));
+
+      // 🧠 Inicializar memoria para esta cuenta si no existe
+      if (!accountMemory[row.account_uuid]) {
+        setAccountMemory(prev => ({
+          ...prev,
+          [row.account_uuid]: []
+        }));
+        addLog(`🧠 Memoria inicializada para cuenta ${row.account_uuid.slice(0, 12)}...`);
+      } else {
+        const previousTitles = accountMemory[row.account_uuid];
+        addLog(`🧠 Memoria recuperada: ${previousTitles.length} títulos previos`);
+        previousTitles.forEach((title, i) => {
+          addLog(`   ${i + 1}. "${title}"`);
+        });
+      }
+
+      // 4️⃣ Cambiar a vista de KEYWORDS para que el usuario confirme
+      setStep(AppStep.KEYWORDS);
+
+    } catch (e: any) {
+      addLog(`❌ Error: ${e.message}`);
+      alert(`Error cargando cuenta ${currentIndex + 1}:\n\n${e.message}`);
     } finally {
       setIsLoading(false);
-      setLoadingStatus("");
+    }
+  };
+
+  // ➡️ Continuar al siguiente artículo en modo CSV
+  const continueToNextArticle = () => {
+    const currentArticle = batchProgress.currentArticle;
+    const totalArticles = batchProgress.totalArticles;
+
+    if (currentArticle >= totalArticles) {
+      // Todos los artículos de esta cuenta procesados
+      const nextAccountIndex = batchProgress.currentAccount; // Ya está en base 1
+      
+      if (nextAccountIndex >= batchProgress.totalAccounts) {
+        // ✅ TODAS LAS CUENTAS COMPLETADAS - Mostrar resumen final
+        addLog(`\n========================================`);
+        addLog(`🎉 ¡PRODUCCIÓN COMPLETADA!`);
+        addLog(`========================================`);
+        addLog(`📊 Total de artículos publicados: ${batchProgress.publishedUrls.length}`);
+        
+        setBatchProgress(prev => ({
+          ...prev,
+          isComplete: true
+        }));
+        
+        // Ir a la vista de ACCOUNT para mostrar el resumen
+        setStep(AppStep.ACCOUNT);
+      } else {
+        // Ir a siguiente cuenta
+        addLog(`✅ Cuenta ${batchProgress.currentAccount} completada`);
+        loadNextCsvAccount();
+      }
+    } else {
+      // Generar siguiente artículo de esta cuenta
+      addLog(`\n📝 Artículo ${currentArticle + 1}/${totalArticles}`);
+      
+      // 🔄 ROTAR KEYWORDS para generar un artículo diferente
+      // Tomar las keywords y ponerlas en diferente orden
+      const rotatedKeywords = [...keywords];
+      
+      // Rotar según el número de artículo actual
+      for (let i = 0; i < currentArticle; i++) {
+        const first = rotatedKeywords.shift();
+        if (first) rotatedKeywords.push(first);
+      }
+      
+      setKeywords(rotatedKeywords);
+      addLog(`🔄 Keywords rotadas para variación: ${rotatedKeywords.join(", ")}`);
+      
+      // Resetear publishResult para limpiar el mensaje anterior
+      setPublishResult(null);
+      
+      setStep(AppStep.KEYWORDS);
     }
   };
 
@@ -1256,10 +1714,7 @@ Generate only the image.`;
           <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
             <i className="fas fa-robot text-white text-xl"></i>
           </div>
-          <div>
-            <h1 className="text-white font-black text-xl tracking-tighter uppercase">Plinng <span className="text-indigo-400">GEO</span></h1>
-            <p className="text-indigo-400 text-[9px] font-medium tracking-wide mt-1">Where SEO meets Generative Engines</p>
-          </div>
+          <h1 className="text-white font-black text-xl tracking-tighter uppercase">Orbidi <span className="text-indigo-400">SEO</span></h1>
         </div>
 
         <div className="flex-1 flex flex-col min-h-0">
@@ -1286,7 +1741,7 @@ Generate only the image.`;
                   <i className="fas fa-fingerprint text-2xl"></i>
                 </div>
                 <h2 className="text-2xl font-black mb-2">Acceso a Datos</h2>
-                <p className="text-slate-400 text-sm mb-10">Introduce tu Bearer Token de PLINNG</p>
+                <p className="text-slate-400 text-sm mb-10">Introduce tu Bearer Token de Orbidi</p>
                 <div className="space-y-6">
                   <input 
                     type="password" 
@@ -1308,6 +1763,107 @@ Generate only the image.`;
 
           {step === AppStep.ACCOUNT && (
             <div className="animate-slideUp max-w-2xl mx-auto">
+              {/* Vista de resumen final cuando se completa todo */}
+              {batchProgress.isComplete ? (
+                <div className="space-y-8">
+                  <div className="text-center">
+                    <div className="inline-block p-8 bg-green-100 rounded-full mb-6">
+                      <i className="fas fa-trophy text-6xl text-green-600"></i>
+                    </div>
+                    <h2 className="text-5xl font-black text-green-900 mb-4">
+                      ¡Producción Masiva Completada!
+                    </h2>
+                    <p className="text-green-600 text-xl">
+                      {batchProgress.publishedUrls.length} artículos publicados exitosamente
+                    </p>
+                  </div>
+
+                  <div className="bg-white p-10 rounded-[4rem] shadow-2xl border border-slate-100">
+                    <h3 className="font-black text-slate-900 text-2xl mb-6 flex items-center gap-3">
+                      <i className="fas fa-link text-indigo-600"></i>
+                      Enlaces Publicados
+                    </h3>
+                    
+                    <div className="space-y-4">
+                      {batchProgress.publishedUrls.map((url, idx) => (
+                        <div key={idx} className="flex items-center gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-200 hover:border-indigo-300 transition-all group">
+                          <div className="flex-shrink-0 w-10 h-10 bg-indigo-100 rounded-xl flex items-center justify-center">
+                            <span className="text-indigo-600 font-black text-lg">{idx + 1}</span>
+                          </div>
+                          <a 
+                            href={url} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="flex-1 text-indigo-600 hover:text-indigo-800 text-base font-semibold truncate group-hover:underline"
+                          >
+                            {url}
+                          </a>
+                          <button 
+                            onClick={() => {
+                              navigator.clipboard.writeText(url);
+                              addLog(`📋 URL copiada: ${url.slice(0, 50)}...`);
+                            }}
+                            className="flex-shrink-0 text-slate-400 hover:text-indigo-600 transition-colors"
+                            title="Copiar URL"
+                          >
+                            <i className="fas fa-copy text-xl"></i>
+                          </button>
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex-shrink-0 text-slate-400 hover:text-green-600 transition-colors"
+                            title="Abrir en nueva pestaña"
+                          >
+                            <i className="fas fa-external-link-alt text-xl"></i>
+                          </a>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex gap-4">
+                    <button 
+                      onClick={updateClickUpTasks}
+                      disabled={isLoading}
+                      className="flex-1 bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-black py-6 rounded-3xl hover:from-purple-700 hover:to-indigo-700 transition-all text-xl flex items-center justify-center gap-4 shadow-2xl"
+                    >
+                      {isLoading ? (
+                        <>
+                          <i className="fas fa-spinner fa-spin"></i>
+                          Actualizando ClickUp...
+                        </>
+                      ) : (
+                        <>
+                          <i className="fas fa-check-double"></i>
+                          Actualizar Tareas en ClickUp
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  <button 
+                    onClick={() => {
+                      setBatchProgress({
+                        currentAccount: 0,
+                        totalAccounts: 0,
+                        currentArticle: 0,
+                        totalArticles: 0,
+                        publishedUrls: [],
+                        isComplete: false
+                      });
+                      setCsvRows([]);
+                      setIsManualMode(false);
+                    }}
+                    className="w-full bg-slate-900 text-white font-black py-6 rounded-3xl hover:bg-black transition-all text-xl flex items-center justify-center gap-4"
+                  >
+                    <i className="fas fa-plus-circle"></i>
+                    Nueva Producción
+                  </button>
+                </div>
+              ) : (
+                /* Vista normal de selección de modo */
+                <>
               <div className="text-center mb-10">
                 <h2 className="text-4xl font-black tracking-tighter mb-3">Producción de Contenido SEO</h2>
                 <p className="text-slate-500 font-medium italic">"De brief a artículo publicado en minutos"</p>
@@ -1551,6 +2107,8 @@ Generate only the image.`;
                   </div>
                 )}
               </div>
+              </>
+              )}
             </div>
           )}
 
@@ -1601,7 +2159,23 @@ Generate only the image.`;
               </div>
               
               <button 
-                onClick={proceedToOutline} 
+                onClick={async () => {
+                  if (batchProgress.totalAccounts > 0) {
+                    // Modo CSV: usar proceedToOutlineCSV
+                    setIsLoading(true);
+                    try {
+                      await proceedToOutlineCSV(keywords);
+                      setStep(AppStep.OUTLINE);
+                    } catch (e: any) {
+                      addLog(`Error: ${e.message}`);
+                    } finally {
+                      setIsLoading(false);
+                    }
+                  } else {
+                    // Modo normal
+                    proceedToOutline();
+                  }
+                }}
                 disabled={keywords.length === 0}
                 className={`w-full font-black py-8 rounded-[3rem] shadow-2xl transition-all text-2xl tracking-tight flex items-center justify-center gap-4 ${keywords.length > 0 ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
               >
@@ -1617,14 +2191,26 @@ Generate only the image.`;
               <div className="bg-white p-14 rounded-[4.5rem] shadow-2xl border border-slate-100 mb-10 space-y-12">
                 <div>
                   <label className="text-[10px] font-black text-indigo-500 uppercase tracking-widest block mb-4">H1 - Título Maestro</label>
-                  <input className="w-full text-4xl font-black text-slate-900 outline-none border-b-2 border-slate-50 focus:border-indigo-200 py-4 transition-all" value={article.title} onChange={e => setArticle({...article, title: e.target.value})} />
+                  <input 
+                    className="w-full text-4xl font-black text-slate-900 outline-none border-b-2 border-slate-50 focus:border-indigo-200 py-4 transition-all" 
+                    value={article.title || ''} 
+                    onChange={e => setArticle({...article, title: e.target.value})} 
+                  />
                 </div>
                 <div className="space-y-6">
                   <label className="text-[10px] font-black text-indigo-500 uppercase tracking-widest block mb-4">H2 - Estructura de Secciones</label>
                   {(article.sections || []).map((s, i) => (
                     <div key={i} className="flex items-center gap-8 p-8 bg-slate-50 rounded-[2.5rem] border border-slate-100 group hover:bg-white hover:shadow-xl transition-all">
                       <div className="w-14 h-14 bg-indigo-600 text-white rounded-2xl flex items-center justify-center font-black text-2xl shadow-xl">{i+1}</div>
-                      <input className="flex-1 bg-transparent font-black text-2xl text-slate-700 outline-none" value={s.title} onChange={e => { const newSec = [...article.sections!]; newSec[i].title = e.target.value; setArticle({...article, sections: newSec}); }} />
+                      <input 
+                        className="flex-1 bg-transparent font-black text-2xl text-slate-700 outline-none" 
+                        value={s.title || ''} 
+                        onChange={e => { 
+                          const newSec = [...article.sections!]; 
+                          newSec[i].title = e.target.value; 
+                          setArticle({...article, sections: newSec}); 
+                        }} 
+                      />
                     </div>
                   ))}
                 </div>
@@ -1638,12 +2224,33 @@ Generate only the image.`;
               <div className="flex flex-col md:flex-row items-center justify-between mb-16 gap-8">
                 <div>
                   <h1 className="text-5xl font-black tracking-tighter text-slate-900">Resultado Final</h1>
-                  <p className="text-slate-400 font-bold uppercase text-[11px] tracking-widest mt-2">Borrador optimizado y listo para WordPress</p>
+                  <p className="text-slate-400 font-bold uppercase text-[11px] tracking-widest mt-2">
+                    {batchProgress.totalAccounts > 0 
+                      ? `Artículo ${batchProgress.currentArticle}/${batchProgress.totalArticles} • Cuenta ${batchProgress.currentAccount}/${batchProgress.totalAccounts}`
+                      : 'Borrador optimizado y listo para WordPress'
+                    }
+                  </p>
                 </div>
                 <div className="flex gap-4 w-full md:w-auto">
-                  <button onClick={() => setStep(AppStep.ACCOUNT)} className="flex-1 md:flex-none px-10 py-5 rounded-[2rem] border-2 border-slate-200 font-black text-[11px] hover:bg-slate-50 transition-all uppercase">NUEVO</button>
+                  {batchProgress.totalAccounts === 0 && (
+                    <button onClick={() => setStep(AppStep.ACCOUNT)} className="flex-1 md:flex-none px-10 py-5 rounded-[2rem] border-2 border-slate-200 font-black text-[11px] hover:bg-slate-50 transition-all uppercase">NUEVO</button>
+                  )}
                   <button 
-                    onClick={publish} 
+                    onClick={async () => {
+                      await publish();
+                      
+                      // Si estamos en modo CSV, actualizar progreso del artículo
+                      if (batchProgress.totalAccounts > 0) {
+                        await wait(500);
+                        
+                        const newArticleCount = batchProgress.currentArticle + 1;
+                        
+                        setBatchProgress(prev => ({
+                          ...prev,
+                          currentArticle: newArticleCount
+                        }));
+                      }
+                    }}
                     disabled={isPublishing} 
                     className="flex-1 md:flex-none bg-indigo-600 text-white px-10 py-5 rounded-[2rem] font-black text-[11px] shadow-2xl hover:bg-indigo-700 transition-all flex items-center justify-center gap-3 uppercase"
                   >
@@ -1654,12 +2261,12 @@ Generate only the image.`;
               </div>
 
               {publishResult && (
-                <div className={`mb-16 p-12 rounded-[4rem] border-4 flex items-center justify-between shadow-2xl animate-slideUp ${publishResult.success ? 'bg-emerald-50 border-emerald-100' : 'bg-rose-50 border-rose-100'}`}>
+                <div className={`mb-16 p-12 rounded-[4rem] border-4 flex flex-col gap-6 shadow-2xl animate-slideUp ${publishResult.success ? 'bg-emerald-50 border-emerald-100' : 'bg-rose-50 border-rose-100'}`}>
                   <div className="flex items-center gap-10">
                     <div className={`w-20 h-20 rounded-full flex items-center justify-center ${publishResult.success ? 'bg-emerald-500' : 'bg-rose-500'} text-white text-4xl shadow-2xl shrink-0`}>
                       <i className={`fas ${publishResult.success ? 'fa-check' : 'fa-times'}`}></i>
                     </div>
-                    <div>
+                    <div className="flex-1">
                       <p className="font-black text-3xl text-slate-900">{publishResult.msg}</p>
                       {publishResult.url && (
                         <a href={publishResult.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 text-indigo-600 font-black underline underline-offset-8 text-lg mt-4 group">
@@ -1669,6 +2276,33 @@ Generate only the image.`;
                       )}
                     </div>
                   </div>
+                  
+                  {/* Botón para continuar en modo CSV */}
+                  {publishResult.success && batchProgress.totalAccounts > 0 && (
+                    <button 
+                      onClick={continueToNextArticle}
+                      className="w-full bg-slate-900 text-white font-black py-6 rounded-3xl hover:bg-black transition-all text-lg flex items-center justify-center gap-3"
+                    >
+                      {batchProgress.currentArticle < batchProgress.totalArticles ? (
+                        <>
+                          <i className="fas fa-arrow-right"></i>
+                          Continuar con Artículo {batchProgress.currentArticle + 1}/{batchProgress.totalArticles}
+                        </>
+                      ) : (
+                        batchProgress.currentAccount < batchProgress.totalAccounts ? (
+                          <>
+                            <i className="fas fa-arrow-right"></i>
+                            Continuar con Cuenta {batchProgress.currentAccount + 1}/{batchProgress.totalAccounts}
+                          </>
+                        ) : (
+                          <>
+                            <i className="fas fa-check-double"></i>
+                            Ver Resumen Final
+                          </>
+                        )
+                      )}
+                    </button>
+                  )}
                 </div>
               )}
 
