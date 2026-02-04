@@ -372,8 +372,7 @@ const improveReadability = (html: string): string => {
 
 const App: React.FC = () => {
   // Configuración de Estados
-  const [step, setStep] = useState<AppStep>(AppStep.AUTH);
-  const [authToken, setAuthToken] = useState('');
+  const [step, setStep] = useState<AppStep>(AppStep.ACCOUNT);
   const [accountUuid, setAccountUuid] = useState('');
 
   const [isManualMode, setIsManualMode] = useState(false); // false = EXTRACCIÓN AUTO, true = CARGA MASIVA CSV
@@ -459,12 +458,14 @@ const App: React.FC = () => {
     try {
       addLog(`🔄 Actualizando ClickUp task ${taskId} con URL...`);
       
+      const CLICKUP_API_KEY = import.meta.env.VITE_CLICKUP_API_KEY;
+      
       const response = await fetch(`https://api.clickup.com/api/v2/task/${taskId}/field/959a5bb5-b1ac-44ec-b814-52f7b415ac91`, {
         method: 'POST',
         headers: {
           'accept': 'application/json',
           'content-type': 'application/json',
-          'Authorization': 'pk_88229489_VXTU9J94MUYGDPXQ80XHST6KY6FIK1XH'
+          'Authorization': CLICKUP_API_KEY
         },
         body: JSON.stringify({ value: url })
       });
@@ -486,12 +487,14 @@ const App: React.FC = () => {
     try {
       addLog(`🔄 Marcando ClickUp task ${taskId} como completada...`);
       
+      const CLICKUP_API_KEY = import.meta.env.VITE_CLICKUP_API_KEY;
+      
       const response = await fetch(`https://api.clickup.com/api/v2/task/${taskId}/field/b39da2a6-e438-4786-aaa6-9774e49bfcc4?custom_task_ids=true`, {
         method: 'POST',
         headers: {
           'accept': 'application/json',
           'content-type': 'application/json',
-          'Authorization': 'pk_88229489_VXTU9J94MUYGDPXQ80XHST6KY6FIK1XH'
+          'Authorization': CLICKUP_API_KEY
         }
       });
 
@@ -875,17 +878,17 @@ const App: React.FC = () => {
  
   // 🔑 FUNCIÓN BASE reutilizable (UI + CSV)
   const fetchBriefByUuid = async (uuid: string): Promise<string> => {
-    const cleanAuth = authToken.trim();
-
-    if (!uuid || !cleanAuth) {
-      throw new Error("UUID o token no disponible");
+    const ORBIDI_BEARER_TOKEN = import.meta.env.VITE_ORBIDI_BEARER_TOKEN;
+    
+    if (!uuid || !ORBIDI_BEARER_TOKEN) {
+      throw new Error("UUID o Bearer Token no disponible");
     }
 
-    const authHeader = cleanAuth.startsWith("Bearer ")
-      ? cleanAuth
-      : `Bearer ${cleanAuth}`;
+    const authHeader = ORBIDI_BEARER_TOKEN.startsWith("Bearer ")
+      ? ORBIDI_BEARER_TOKEN
+      : `Bearer ${ORBIDI_BEARER_TOKEN}`;
 
-    const apiKey = "YDROlQMf.p9UwbdkpUyDiAzDd7IGK4mlKDinJkGWQ";
+    const ORBIDI_API_KEY = import.meta.env.VITE_ORBIDI_API_KEY;
 
     const res = await fetch(
       `https://eu.api.orbidi.com/prod-line/space-management/accounts/${uuid}/brief`,
@@ -893,7 +896,7 @@ const App: React.FC = () => {
         headers: {
           Accept: "application/json, text/html",
           Authorization: authHeader,
-          "x-api-key": apiKey,
+          "x-api-key": ORBIDI_API_KEY,
         },
       }
     );
@@ -917,7 +920,7 @@ const App: React.FC = () => {
     }
 
     setIsLoading(true);
-    setLoadingStatus("Conectando con PLINNG...");
+    setLoadingStatus("Conectando con Orbidi...");
 
     try {
       const rawText = await fetchBriefByUuid(cleanUuid);
@@ -1230,7 +1233,7 @@ Generate only the image.`;
   const publish = async (articleToPublish?: Partial<Article>): Promise<{ success: boolean; msg: string; url?: string }> => {
     setIsPublishing(true);
     setPublishResult(null);
-    const WP_TOKEN = `Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsIm5hbWUiOiJhZG1pbl90eXYxbGE5eiIsImlhdCI6MTc2ODk0NjU4OCwiZXhwIjoxOTI2NjI2NTg4fQ.u68uZRSdvnyPBCGAygCWEp4QbfzK8lYnbaMzOcxk7S0`;
+    const WP_TOKEN = import.meta.env.VITE_WORDPRESS_TOKEN;
     
     // Usar el artículo pasado como parámetro o el del estado
     const currentArticle = articleToPublish || article;
@@ -2050,12 +2053,14 @@ Generate only the image.`;
           addLog(`🎯 Prodline Task: ${taskId.slice(0, 8)}...`);
 
           try {
+            const PRODLINE_API_KEY = import.meta.env.VITE_PRODLINE_API_KEY;
+            
             const response = await fetch(
               `https://eu.api.orbidi.com/prod-line/task/task-management/tasks/${taskId}/properties`,
               {
                 method: 'POST',
                 headers: {
-                  'X-Api-Key': 'YDROlQMf.p9UwbdkpUyDiAzDd7IGK4mlKDinJkGWQ',
+                  'X-Api-Key': PRODLINE_API_KEY,
                   'Content-Type': 'application/json',
                   'Accept': 'application/json'
                 },
@@ -2138,33 +2143,6 @@ Generate only the image.`;
       <main className="flex-1 overflow-y-auto h-screen relative bg-white">
         <div className="max-w-4xl mx-auto p-12 lg:p-24">
           
-          {step === AppStep.AUTH && (
-            <div className="flex flex-col items-center justify-center min-h-[60vh] animate-slideUp">
-              <div className="bg-white p-12 rounded-[3.5rem] shadow-2xl border border-slate-100 max-w-md w-full text-center">
-                <div className="w-16 h-16 bg-[#A4D62C]/10 rounded-2xl flex items-center justify-center mx-auto mb-8 text-[#A4D62C]">
-                  <i className="fas fa-fingerprint text-2xl"></i>
-                </div>
-                <h2 className="text-2xl font-black mb-2">Acceso a Datos</h2>
-                <p className="text-slate-400 text-sm mb-10">Introduce tu Bearer Token de PLINNG</p>
-                <div className="space-y-6">
-                  <input 
-                    type="password" 
-                    className="w-full px-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-[#A4D62C] outline-none font-bold"
-                    placeholder="Bearer eyJhbGci..."
-                    value={authToken}
-                    onChange={e => setAuthToken(e.target.value)}
-                  />
-                  <button 
-                    onClick={() => setStep(AppStep.ACCOUNT)}
-                    className="w-full bg-slate-900 text-white font-black py-5 rounded-2xl shadow-xl hover:bg-black transition-all text-xs uppercase tracking-widest"
-                  >
-                    Establecer Conexión
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
           {step === AppStep.ACCOUNT && (
             <div className="animate-slideUp max-w-2xl mx-auto">
               {/* Vista de resumen final cuando se completa todo */}
