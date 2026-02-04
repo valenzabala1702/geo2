@@ -14,6 +14,7 @@ interface CsvRow {
   kw: string;  // Keywords separadas por comas
   task_count: number;  // Número de artículos a generar
   task_clickup_ids: string;  // IDs de ClickUp separados por comas
+  task_prodline_ids?: string;  // IDs de Prodline separados por comas (opcional)
 }
 
 // 🔧 Normaliza cualquier imagen base64 a 1536×864 usando canvas
@@ -391,6 +392,27 @@ const App: React.FC = () => {
   // 📄 Producción masiva desde CSV
   const [csvRows, setCsvRows] = useState<CsvRow[]>([]);
   const [currentRowIndex, setCurrentRowIndex] = useState(0);
+  
+  // 🔗 Array de URLs publicadas (useRef para acceso inmediato sin esperar estado)
+  const publishedUrlsRef = React.useRef<string[]>([]);
+  
+  // 📊 Ref para totalArticles (acceso inmediato sin esperar estado)
+  const totalArticlesRef = React.useRef<number>(0);
+  
+  // 🔑 Ref para keywords originales de la cuenta actual
+  const originalKeywordsRef = React.useRef<string[]>([]);
+  
+  // 🌐 Ref para website del cliente actual
+  const clientWebsiteRef = React.useRef<string | null>(null);
+  
+  // 📊 Refs para progreso de cuentas
+  const currentAccountRef = React.useRef<number>(0);
+  const totalAccountsRef = React.useRef<number>(0);
+  const currentArticleRef = React.useRef<number>(0); // Contador de artículos de la cuenta actual
+  
+  // 🛑 Flag para evitar ejecuciones múltiples
+  const isProcessingRef = React.useRef<boolean>(false);
+  
   const [batchProgress, setBatchProgress] = useState<{
     currentAccount: number;
     totalAccounts: number;
@@ -415,18 +437,16 @@ const App: React.FC = () => {
 
   // 📋 Capturar URLs publicadas automáticamente en modo CSV
   React.useEffect(() => {
-    // Solo en modo CSV y si la publicación fue exitosa
     if (batchProgress.totalAccounts > 0 && publishResult?.success && publishResult.url) {
-      // Verificar si la URL ya está en el array (evitar duplicados)
       if (!batchProgress.publishedUrls.includes(publishResult.url)) {
         setBatchProgress(prev => ({
           ...prev,
           publishedUrls: [...prev.publishedUrls, publishResult.url!]
         }));
-        addLog(`✅ URL guardada en resumen: ${publishResult.url}`);
+        addLog(`✅ URL guardada: ${publishResult.url}`);
       }
     }
-  }, [publishResult]); // Se ejecuta cada vez que publishResult cambia
+  }, [publishResult]);
 
   const addLog = (msg: string) => {
     setLogs(prev => [...prev.slice(-25), `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -629,12 +649,14 @@ const App: React.FC = () => {
       const taskCountStr = values[headers.indexOf("task_count")] || "1";
       const taskCount = parseInt(taskCountStr, 10);
       const taskClickupIds = values[headers.indexOf("task_clickup_ids")] || "";
+      const taskProdlineIds = values[headers.indexOf("task_prodline_ids")] || "";
 
       return {
         account_uuid: accountUuid,
         kw: kw,
         task_count: isNaN(taskCount) || taskCount <= 0 ? 1 : taskCount,
         task_clickup_ids: taskClickupIds,
+        task_prodline_ids: taskProdlineIds,
       };
     }).filter(row => row.account_uuid && row.kw);
 
@@ -895,7 +917,7 @@ const App: React.FC = () => {
     }
 
     setIsLoading(true);
-    setLoadingStatus("Conectando con Orbidi...");
+    setLoadingStatus("Conectando con PLINNG...");
 
     try {
       const rawText = await fetchBriefByUuid(cleanUuid);
@@ -984,11 +1006,26 @@ const App: React.FC = () => {
     }
   };
 
-  const startWriting = async (): Promise<Partial<Article>> => {
+  const startWriting = async (articleToUse?: Partial<Article>, websiteUrl?: string | null): Promise<Partial<Article>> => {
     setIsLoading(true);
 
     try {
-      const sections = [...(article.sections || [])];
+      // Usar el artículo pasado como parámetro o el del estado
+      const currentArticle = articleToUse || article;
+      // Usar el website pasado como parámetro o el del estado
+      const currentWebsite = websiteUrl !== undefined ? websiteUrl : clientWebsite;
+      
+      const sections = [...(currentArticle.sections || [])];
+      
+      if (sections.length === 0) {
+        throw new Error("No hay secciones para redactar. El artículo está vacío.");
+      }
+      
+      addLog(`📝 Redactando ${sections.length} secciones del artículo...`);
+      
+      if (currentWebsite) {
+        addLog(`🌐 Website del cliente: ${currentWebsite}`);
+      }
 
       // 1️⃣ Generar contenido de cada sección
       for (let i = 0; i < sections.length; i++) {
@@ -996,7 +1033,7 @@ const App: React.FC = () => {
 
         const rawContent = await generateSectionContent(
           sections[i],
-          article.title || ""
+          currentArticle.title || ""
         );
 
         // ✅ APLICAR MEJORA DE LEGIBILIDAD (Flesch-Kincaid > 60)
@@ -1014,12 +1051,12 @@ const App: React.FC = () => {
       // 🔗 2️⃣ INSERCIÓN DE ENLACES INTERNOS (SOLO SI EL CLIENTE TIENE WEB)
       let finalSections = sections;
       
-      if (clientWebsite) {
+      if (currentWebsite) {
         // ✅ CLIENTE TIENE WEB: Insertar 3 enlaces obligatorios
         setLoadingStatus("Generando enlaces internos...");
         addLog("🔗 Generando 3 enlaces internos estándar del cliente...");
 
-        const internalLinks = generateClientInternalLinks(clientWebsite);
+        const internalLinks = generateClientInternalLinks(currentWebsite);
         
         addLog(`✅ Enlaces generados:`);
         internalLinks.forEach((link, i) => {
@@ -1112,7 +1149,7 @@ SEO & accessibility guidance (internal)
 Article context
 Main keyword: ${keywords[0]}
 
-Article topic: ${article.title}
+Article topic: ${currentArticle.title}
 
 Generate only the image.`;
 
@@ -1153,19 +1190,20 @@ Generate only the image.`;
 
       // 5️⃣ CONSTRUIR ARTÍCULO COMPLETO
       const completeArticle: Partial<Article> = {
-        ...article,
+        title: currentArticle.title,
         sections: finalSections,
+        primaryKeywords: currentArticle.primaryKeywords,
         featuredImage: {
           prompt: imagePrompt,
           size: "1536x864",
-          altText: `${article.title} - ${keywords[0]}`,
+          altText: `${currentArticle.title} - ${keywords[0]}`,
           base64: imageBase64,
         },
       };
 
       addLog("✓ Imagen editorial final aceptada.");
       
-      if (clientWebsite) {
+      if (currentWebsite) {
         addLog(`✅ Artículo completo: 3 enlaces internos + imagen 1536×864 + legibilidad optimizada`);
       } else {
         addLog(`✅ Artículo completo: imagen 1536×864 + legibilidad optimizada (sin enlaces internos)`);
@@ -1189,20 +1227,23 @@ Generate only the image.`;
     }
   };
 
-  const publish = async () => {
+  const publish = async (articleToPublish?: Partial<Article>): Promise<{ success: boolean; msg: string; url?: string }> => {
     setIsPublishing(true);
     setPublishResult(null);
     const WP_TOKEN = `Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsIm5hbWUiOiJhZG1pbl90eXYxbGE5eiIsImlhdCI6MTc2ODk0NjU4OCwiZXhwIjoxOTI2NjI2NTg4fQ.u68uZRSdvnyPBCGAygCWEp4QbfzK8lYnbaMzOcxk7S0`;
+    
+    // Usar el artículo pasado como parámetro o el del estado
+    const currentArticle = articleToPublish || article;
     
     try {
       let featuredMediaId: number | null = null;
 
       // 1. Si hay imagen generada, subirla primero
-      if (article.featuredImage && typeof article.featuredImage === 'object' && article.featuredImage.base64) {
+      if (currentArticle.featuredImage && typeof currentArticle.featuredImage === 'object' && currentArticle.featuredImage.base64) {
         setLoadingStatus("Subiendo imagen a la web...");
         featuredMediaId = await uploadImageToWP(
-          article.featuredImage.base64, 
-          article.title || "SEO Article Image", 
+          currentArticle.featuredImage.base64, 
+          currentArticle.title || "SEO Article Image", 
           WP_TOKEN
         );
       }
@@ -1241,8 +1282,8 @@ Generate only the image.`;
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': WP_TOKEN },
         body: JSON.stringify({
-          title: article.title,
-          content: (article.sections || []).map(s => `<h2>${s.title}</h2><div>${s.content}</div>`).join(""),
+          title: currentArticle.title,
+          content: (currentArticle.sections || []).map(s => `<h2>${s.title}</h2><div>${s.content}</div>`).join(""),
           status: 'publish',
           featured_media: featuredMediaId || undefined,
           categories: categoryId ? [categoryId] : undefined
@@ -1255,22 +1296,28 @@ Generate only the image.`;
       }
 
       const post = await response.json();
-      setPublishResult({ 
+      const result = { 
         success: true, 
         msg: "¡Artículo publicado con imagen y categoría SEO!", 
         url: post.link 
-      });
+      };
+      
+      setPublishResult(result);
       addLog(`✓ Publicación exitosa en masproposals.com`);
       addLog(`✓ Categoría: SEO On page - Blog`);
       
-      if (clientWebsite) {
+      if (currentArticle.sections?.some(s => s.content?.includes('<a href='))) {
         addLog(`✓ Enlaces internos: 3 incluidos`);
       } else {
         addLog(`ℹ️ Enlaces internos: 0 (cliente sin web)`);
       }
+      
+      return result; // Retornar el resultado
     } catch (e: any) {
-      setPublishResult({ success: false, msg: e.message });
+      const errorResult = { success: false, msg: e.message };
+      setPublishResult(errorResult);
       addLog(`❌ Fallo en publicación: ${e.message}`);
+      return errorResult; // Retornar error
     } finally {
       setIsPublishing(false);
       setLoadingStatus("");
@@ -1543,7 +1590,7 @@ Generate only the image.`;
     }
   };
 
-  // 🏭 Inicia la producción masiva desde CSV (modo semi-automático)
+  // 🏭 Inicia la producción masiva desde CSV (semi-automático con auto-clicks)
   const startBatchProduction = async () => {
     if (csvRows.length === 0) {
       alert("No hay filas CSV cargadas");
@@ -1551,6 +1598,15 @@ Generate only the image.`;
     }
 
     // Resetear progreso
+    publishedUrlsRef.current = []; // Limpiar URLs del ref
+    totalArticlesRef.current = 0; // Resetear total de artículos
+    originalKeywordsRef.current = []; // Limpiar keywords originales
+    clientWebsiteRef.current = null; // Limpiar website
+    currentAccountRef.current = 0;
+    totalAccountsRef.current = csvRows.length;
+    currentArticleRef.current = 0; // Resetear contador de artículos
+    isProcessingRef.current = false; // Resetear flag
+    
     setBatchProgress({
       currentAccount: 0,
       totalAccounts: csvRows.length,
@@ -1566,14 +1622,28 @@ Generate only the image.`;
 
   // 📥 Cargar la siguiente cuenta del CSV
   const loadNextCsvAccount = async () => {
-    const currentIndex = batchProgress.currentAccount;
+    const currentIndex = currentAccountRef.current; // Usar ref en lugar de estado
+    
+    addLog(`🔍 loadNextCsvAccount llamado con index: ${currentIndex}`);
     
     if (currentIndex >= csvRows.length) {
-      // Todas las cuentas procesadas
+      // Todas las cuentas procesadas - actualizar ClickUp automáticamente
+      addLog(`✅ Todas las ${csvRows.length} cuentas procesadas`);
       setBatchProgress(prev => ({
         ...prev,
         isComplete: true
       }));
+      
+      // Esperar un momento y actualizar ClickUp
+      await wait(2000);
+      await updateClickUpTasksAutomatic(publishedUrlsRef.current);
+      
+      // Actualizar Prodline
+      await wait(1000);
+      await updateProdlineTasks();
+      
+      // Mostrar resumen
+      setStep(AppStep.ACCOUNT);
       return;
     }
 
@@ -1584,12 +1654,13 @@ Generate only the image.`;
     addLog(`📂 CUENTA ${currentIndex + 1}/${csvRows.length}`);
     addLog(`========================================`);
 
+    let keywordsToUse: string[] = [];
+    let detectedWebsite: string | null = null;
+
     try {
       // 1️⃣ Obtener brief
       addLog(`📥 Obteniendo brief...`);
       const rawText = await fetchBriefByUuid(row.account_uuid);
-      
-      let detectedWebsite: string | null = null;
       
       if (rawText.toLowerCase().includes("<!doctype html") || rawText.includes("<html")) {
         detectedWebsite = await handleDataAcquisition(rawText, true);
@@ -1599,9 +1670,11 @@ Generate only the image.`;
       }
       
       if (detectedWebsite) {
+        clientWebsiteRef.current = detectedWebsite; // Guardar en ref
         setClientWebsite(detectedWebsite);
         addLog(`✅ Website detectado: ${detectedWebsite}`);
       } else {
+        clientWebsiteRef.current = null; // Limpiar ref
         setClientWebsite(null);
         addLog(`ℹ️ Sin website`);
       }
@@ -1615,81 +1688,223 @@ Generate only the image.`;
       const allKeywords = keywordsText.split(",").map(k => k.trim()).filter(k => k.length > 0);
       if (allKeywords.length === 0) throw new Error("No hay keywords válidas");
       
-      const keywordsToUse = allKeywords.slice(0, 5);
+      keywordsToUse = allKeywords.slice(0, 5);
+      originalKeywordsRef.current = keywordsToUse; // Guardar en ref para acceso inmediato
       setKeywords(keywordsToUse);
       addLog(`🔑 Keywords: ${keywordsToUse.join(", ")}`);
 
       // 3️⃣ Actualizar progreso
+      totalArticlesRef.current = row.task_count; // Actualizar ref
+      currentAccountRef.current = currentIndex + 1; // Actualizar ref
+      currentArticleRef.current = 0; // ← RESETEAR contador de artículos para nueva cuenta
+      
+      addLog(`🔄 RESETEANDO CONTADOR DE ARTÍCULOS para nueva cuenta`);
+      addLog(`  - task_count de esta cuenta: ${row.task_count}`);
+      addLog(`  - currentArticleRef reseteado a: 0`);
+      
       setBatchProgress(prev => ({
         ...prev,
         currentAccount: currentIndex + 1,
-        currentArticle: 0,
+        currentArticle: 0, // ← RESETEA A 0 para nueva cuenta
         totalArticles: row.task_count,
-        currentAccountUuid: row.account_uuid // ← Guardar UUID actual
+        currentAccountUuid: row.account_uuid
       }));
 
-      // 🧠 Inicializar memoria para esta cuenta si no existe
+      // 🧠 Inicializar memoria para esta cuenta
       if (!accountMemory[row.account_uuid]) {
         setAccountMemory(prev => ({
           ...prev,
           [row.account_uuid]: []
         }));
-        addLog(`🧠 Memoria inicializada para cuenta ${row.account_uuid.slice(0, 12)}...`);
-      } else {
-        const previousTitles = accountMemory[row.account_uuid];
-        addLog(`🧠 Memoria recuperada: ${previousTitles.length} títulos previos`);
-        previousTitles.forEach((title, i) => {
-          addLog(`   ${i + 1}. "${title}"`);
-        });
+        addLog(`🧠 Memoria inicializada`);
       }
 
-      // 4️⃣ Cambiar a vista de KEYWORDS para que el usuario confirme
+      // 4️⃣ Cambiar a vista de KEYWORDS
       setStep(AppStep.KEYWORDS);
 
     } catch (e: any) {
       addLog(`❌ Error: ${e.message}`);
       alert(`Error cargando cuenta ${currentIndex + 1}:\n\n${e.message}`);
+      return; // No continuar si hay error
     } finally {
       setIsLoading(false);
     }
+    
+    // ⏰ AUTO-CLICK: Esperar 2 segundos y generar estructura automáticamente
+    await wait(2000);
+    
+    // Usar el ref que siempre tiene el valor actualizado
+    const websiteToUse = clientWebsiteRef.current;
+    addLog(`🔍 Pasando website a autoGenerateOutline: ${websiteToUse || 'null'}`);
+    
+    await autoGenerateOutline(keywordsToUse, websiteToUse);
   };
 
-  // ➡️ Continuar al siguiente artículo en modo CSV
-  const continueToNextArticle = () => {
-    const currentArticle = batchProgress.currentArticle;
-    const totalArticles = batchProgress.totalArticles;
+  // 🤖 AUTO-CLICK: Generar estructura automáticamente
+  const autoGenerateOutline = async (keywordsToUse: string[], websiteUrl: string | null) => {
+    setIsLoading(true);
+    let generatedArticle: any = null;
+    
+    try {
+      generatedArticle = await proceedToOutlineCSV(keywordsToUse);
+      setStep(AppStep.OUTLINE);
+    } catch (e: any) {
+      addLog(`Error: ${e.message}`);
+      return; // No continuar si hay error
+    } finally {
+      setIsLoading(false);
+    }
+    
+    // ⏰ AUTO-CLICK: Esperar 2 segundos y redactar automáticamente
+    await wait(2000);
+    await autoStartWriting(generatedArticle, websiteUrl);
+  };
+
+  // 🤖 AUTO-CLICK: Redactar artículo automáticamente
+  const autoStartWriting = async (generatedArticle: any, websiteUrl: string | null) => {
+    addLog("🤖 Iniciando auto-redacción...");
+    addLog(`🔍 Artículo recibido con ${generatedArticle?.sections?.length || 0} secciones`);
+    if (websiteUrl) {
+      addLog(`🌐 Website del cliente disponible: ${websiteUrl}`);
+    }
+    
+    try {
+      // Pasar el artículo generado Y el website DIRECTAMENTE a startWriting
+      const completedArticle = await startWriting(generatedArticle, websiteUrl);
+      
+      addLog(`🔍 Artículo completado: ${completedArticle ? 'SÍ' : 'NO'}`);
+      addLog(`🔍 Secciones finales: ${completedArticle?.sections?.length || 0}`);
+      
+      if (!completedArticle || !completedArticle.sections || completedArticle.sections.length === 0) {
+        addLog("❌ Error: artículo vacío o sin secciones");
+        return;
+      }
+      
+      addLog("✅ Artículo validado correctamente");
+      
+      // ⚠️ IMPORTANTE: Actualizar el estado con el artículo completado para que publish() lo vea
+      setArticle(completedArticle);
+      
+      // ⏰ AUTO-CLICK: Esperar 3 segundos y publicar automáticamente
+      await wait(3000);
+      await autoPublish(completedArticle);
+    } catch (error: any) {
+      addLog(`❌ Error en autoStartWriting: ${error.message}`);
+      throw error;
+    }
+  };
+
+  // 🤖 AUTO-CLICK: Publicar automáticamente
+  const autoPublish = async (completedArticle: Partial<Article>) => {
+    addLog(`\n📤 === PUBLICANDO ARTÍCULO ===`);
+    addLog(`🔍 Estado ANTES de publicar:`);
+    addLog(`  - currentArticleRef.current: ${currentArticleRef.current}`);
+    addLog(`  - totalArticlesRef.current: ${totalArticlesRef.current}`);
+    
+    const result = await publish(completedArticle);
+    
+    // Incrementar el contador de artículos usando el REF
+    currentArticleRef.current = currentArticleRef.current + 1;
+    const newCurrentArticle = currentArticleRef.current;
+    
+    addLog(`🔍 Estado DESPUÉS de publicar:`);
+    addLog(`  - newCurrentArticle (ref): ${newCurrentArticle}`);
+    addLog(`  - totalArticlesRef.current: ${totalArticlesRef.current}`);
+    addLog(`  - ¿Debería terminar? ${newCurrentArticle >= totalArticlesRef.current}`);
+    
+    // 📋 Capturar URL directamente del resultado retornado
+    if (result?.success && result.url) {
+      addLog(`📋 Capturando URL para ClickUp: ${result.url}`);
+      
+      // Agregar al ref (acceso inmediato)
+      publishedUrlsRef.current.push(result.url);
+      addLog(`📊 URLs acumuladas: ${publishedUrlsRef.current.length}`);
+      
+      // Agregar al estado (para UI)
+      setBatchProgress(prev => ({
+        ...prev,
+        currentArticle: newCurrentArticle,
+        publishedUrls: [...prev.publishedUrls, result.url!]
+      }));
+    } else {
+      addLog(`⚠️ No se capturó URL de publicación`);
+      // Solo actualizar el contador si no hay URL
+      setBatchProgress(prev => ({
+        ...prev,
+        currentArticle: newCurrentArticle
+      }));
+    }
+    
+    // ⏰ AUTO-CLICK: Pasar valores actualizados a autoContinue
+    await wait(1000);
+    await autoContinue(newCurrentArticle, totalArticlesRef.current);
+  };
+
+  // 🤖 AUTO-CLICK: Continuar automáticamente
+  const autoContinue = async (updatedCurrentArticle?: number, updatedTotalArticles?: number) => {
+    // Usar valores pasados como parámetro o leer del estado
+    const currentArticle = updatedCurrentArticle !== undefined ? updatedCurrentArticle : batchProgress.currentArticle;
+    const totalArticles = updatedTotalArticles !== undefined ? updatedTotalArticles : batchProgress.totalArticles;
+    
+    addLog(`\n🔍 === DECISIÓN DE CONTINUACIÓN ===`);
+    addLog(`🔍 currentArticle: ${currentArticle}`);
+    addLog(`🔍 totalArticles: ${totalArticles}`);
+    addLog(`🔍 ¿Terminó cuenta? ${currentArticle >= totalArticles}`);
 
     if (currentArticle >= totalArticles) {
-      // Todos los artículos de esta cuenta procesados
-      const nextAccountIndex = batchProgress.currentAccount; // Ya está en base 1
+      // Terminaron los artículos de esta cuenta
+      addLog(`✅ Cuenta completada: ${currentArticle}/${totalArticles} artículos generados`);
       
-      if (nextAccountIndex >= batchProgress.totalAccounts) {
-        // ✅ TODAS LAS CUENTAS COMPLETADAS - Mostrar resumen final
-        addLog(`\n========================================`);
-        addLog(`🎉 ¡PRODUCCIÓN COMPLETADA!`);
-        addLog(`========================================`);
-        addLog(`📊 Total de artículos publicados: ${batchProgress.publishedUrls.length}`);
+      const currentAccountNumber = currentAccountRef.current;
+      const totalAccountsNumber = totalAccountsRef.current;
+      
+      addLog(`🔍 Verificando cuentas: ${currentAccountNumber}/${totalAccountsNumber}`);
+      
+      if (currentAccountNumber >= totalAccountsNumber) {
+        // ✅ TODAS LAS CUENTAS COMPLETADAS
+        addLog(`\n🎉 ¡PRODUCCIÓN COMPLETADA!`);
+        addLog(`📊 Total de URLs capturadas: ${publishedUrlsRef.current.length}`);
+        addLog(`🛑 FINALIZANDO - NO se generarán más artículos`);
         
         setBatchProgress(prev => ({
           ...prev,
           isComplete: true
         }));
         
-        // Ir a la vista de ACCOUNT para mostrar el resumen
+        // Actualizar ClickUp automáticamente usando el ref
+        await wait(2000);
+        await updateClickUpTasksAutomatic(publishedUrlsRef.current);
+        
+        // Actualizar Prodline después de ClickUp
+        await wait(1000);
+        await updateProdlineTasks();
+        
         setStep(AppStep.ACCOUNT);
+        return; // ← RETURN EXPLÍCITO - NO CONTINUAR
       } else {
         // Ir a siguiente cuenta
-        addLog(`✅ Cuenta ${batchProgress.currentAccount} completada`);
-        loadNextCsvAccount();
+        addLog(`➡️ Pasando a siguiente cuenta...`);
+        addLog(`✅ Cuenta ${currentAccountNumber} de ${totalAccountsNumber} completada`);
+        await wait(2000);
+        await loadNextCsvAccount();
+        return; // ← RETURN EXPLÍCITO - NO CONTINUAR
       }
     } else {
       // Generar siguiente artículo de esta cuenta
-      addLog(`\n📝 Artículo ${currentArticle + 1}/${totalArticles}`);
+      addLog(`\n✅ === GENERANDO SIGUIENTE ARTÍCULO ===`);
+      addLog(`📝 Artículo ${currentArticle + 1} de ${totalArticles}`);
       
-      // 🔄 ROTAR KEYWORDS para generar un artículo diferente
-      // Tomar las keywords y ponerlas en diferente orden
-      const rotatedKeywords = [...keywords];
+      // Rotar keywords desde las ORIGINALES (no del estado)
+      const originalKeywords = originalKeywordsRef.current;
       
+      if (originalKeywords.length === 0) {
+        addLog(`❌ Error: No hay keywords originales guardadas`);
+        throw new Error("No hay keywords originales para el siguiente artículo");
+      }
+      
+      addLog(`🔑 Keywords originales: ${originalKeywords.join(", ")}`);
+      
+      const rotatedKeywords = [...originalKeywords];
       // Rotar según el número de artículo actual
       for (let i = 0; i < currentArticle; i++) {
         const first = rotatedKeywords.shift();
@@ -1697,31 +1912,220 @@ Generate only the image.`;
       }
       
       setKeywords(rotatedKeywords);
-      addLog(`🔄 Keywords rotadas para variación: ${rotatedKeywords.join(", ")}`);
+      addLog(`🔄 Keywords rotadas: ${rotatedKeywords.join(", ")}`);
       
-      // Resetear publishResult para limpiar el mensaje anterior
+      // Resetear publishResult
       setPublishResult(null);
       
+      // Ir a keywords
       setStep(AppStep.KEYWORDS);
+      
+      // Auto-generar outline para el siguiente artículo
+      addLog(`🚀 Iniciando generación del artículo ${currentArticle + 1}...`);
+      
+      const websiteToUse = clientWebsiteRef.current;
+      if (websiteToUse) {
+        addLog(`🌐 Usando website de la cuenta: ${websiteToUse}`);
+      } else {
+        addLog(`ℹ️ Cuenta sin website - no se generarán enlaces internos`);
+      }
+      
+      await wait(2000);
+      await autoGenerateOutline(rotatedKeywords, websiteToUse);
     }
   };
 
+  // 📋 Versión automática de actualización de ClickUp
+  const updateClickUpTasksAutomatic = async (urls: string[]) => {
+    if (csvRows.length === 0 || urls.length === 0) {
+      addLog("❌ No hay URLs o filas CSV para actualizar");
+      return;
+    }
+
+    addLog(`\n========================================`);
+    addLog(`📋 ACTUALIZANDO CLICKUP`);
+    addLog(`========================================`);
+
+    setIsLoading(true);
+    setLoadingStatus("Actualizando tareas en ClickUp...");
+
+    let urlIndex = 0;
+    let successCount = 0;
+
+    try {
+      for (const row of csvRows) {
+        const taskIds = row.task_clickup_ids
+          .split(',')
+          .map(id => id.trim())
+          .filter(id => id.length > 0);
+
+        if (taskIds.length === 0) {
+          addLog(`⚠️ No hay task IDs para cuenta ${row.account_uuid.slice(0, 12)}...`);
+          continue;
+        }
+
+        addLog(`\n📦 Procesando ${taskIds.length} tareas...`);
+
+        for (let i = 0; i < taskIds.length; i++) {
+          if (urlIndex >= urls.length) {
+            addLog(`⚠️ No hay más URLs disponibles`);
+            break;
+          }
+
+          const taskId = taskIds[i];
+          const url = urls[urlIndex];
+
+          addLog(`🎯 Task ${i + 1}: ${taskId}`);
+
+          const urlSuccess = await updateClickUpTaskUrl(taskId, url);
+          await wait(500);
+
+          if (urlSuccess) {
+            const completeSuccess = await markClickUpTaskComplete(taskId);
+            await wait(500);
+
+            if (completeSuccess) {
+              successCount++;
+            }
+          }
+
+          urlIndex++;
+        }
+      }
+
+      addLog(`\n========================================`);
+      addLog(`✅ CLICKUP ACTUALIZADO`);
+      addLog(`========================================`);
+      addLog(`📊 ${successCount} tareas actualizadas exitosamente`);
+
+    } catch (e: any) {
+      addLog(`❌ Error actualizando ClickUp: ${e.message}`);
+    } finally {
+      setIsLoading(false);
+      setLoadingStatus("");
+    }
+  };
+
+  // 🏭 Actualizar tareas de Prodline
+  const updateProdlineTasks = async (): Promise<void> => {
+    if (csvRows.length === 0) {
+      addLog("❌ No hay filas CSV para actualizar Prodline");
+      return;
+    }
+
+    addLog(`\n========================================`);
+    addLog(`🏭 ACTUALIZANDO PRODLINE`);
+    addLog(`========================================`);
+
+    setIsLoading(true);
+    setLoadingStatus("Actualizando tareas en Prodline...");
+
+    let successCount = 0;
+    let hasAnyProdlineIds = false;
+
+    try {
+      for (const row of csvRows) {
+        // Verificar si existe la columna task_prodline_ids
+        if (!row.task_prodline_ids || typeof row.task_prodline_ids !== 'string' || row.task_prodline_ids.trim().length === 0) {
+          // No mostrar log por cada fila si no existe la columna
+          continue;
+        }
+
+        hasAnyProdlineIds = true;
+
+        // Parsear los IDs de Prodline
+        const prodlineIds = row.task_prodline_ids
+          .split(',')
+          .map(id => id.trim())
+          .filter(id => id.length > 0);
+
+        if (prodlineIds.length === 0) {
+          addLog(`⚠️ Prodline IDs vacíos para cuenta ${row.account_uuid.slice(0, 12)}...`);
+          continue;
+        }
+
+        addLog(`\n📦 Procesando ${prodlineIds.length} tareas de Prodline...`);
+
+        for (const taskId of prodlineIds) {
+          addLog(`🎯 Prodline Task: ${taskId.slice(0, 8)}...`);
+
+          try {
+            const response = await fetch(
+              `https://eu.api.orbidi.com/prod-line/task/task-management/tasks/${taskId}/properties`,
+              {
+                method: 'POST',
+                headers: {
+                  'X-Api-Key': 'YDROlQMf.p9UwbdkpUyDiAzDd7IGK4mlKDinJkGWQ',
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json'
+                },
+                body: JSON.stringify({
+                  assigned_team: 'content_factory'
+                })
+              }
+            );
+
+            if (response.ok) {
+              addLog(`✅ Prodline task ${taskId.slice(0, 8)}... actualizada`);
+              successCount++;
+            } else {
+              const errorText = await response.text();
+              addLog(`❌ Error ${response.status} en Prodline task ${taskId.slice(0, 8)}...`);
+              addLog(`   Respuesta: ${errorText}`);
+              addLog(`   URL: ${response.url}`);
+              
+              // Debug: mostrar los headers enviados
+              console.error('Prodline Error Details:', {
+                status: response.status,
+                statusText: response.statusText,
+                taskId: taskId,
+                url: response.url,
+                errorBody: errorText
+              });
+            }
+
+            await wait(500); // Esperar entre llamadas
+          } catch (error: any) {
+            addLog(`❌ Error llamando API Prodline para ${taskId.slice(0, 8)}...: ${error.message}`);
+          }
+        }
+      }
+
+      addLog(`\n========================================`);
+      addLog(`✅ PRODLINE ACTUALIZADO`);
+      addLog(`========================================`);
+      
+      if (!hasAnyProdlineIds) {
+        addLog(`ℹ️ No se encontraron IDs de Prodline en el CSV`);
+        addLog(`💡 Tip: Agrega la columna 'task_prodline_ids' al CSV para habilitar esta función`);
+      } else {
+        addLog(`📊 ${successCount} tareas actualizadas exitosamente`);
+      }
+
+    } catch (e: any) {
+      addLog(`❌ Error actualizando Prodline: ${e.message}`);
+    } finally {
+      setIsLoading(false);
+      setLoadingStatus("");
+    }
+  };
+
+  // 📥 Cargar la siguiente cuenta del CSV
   return (
     <div className="min-h-screen bg-[#F8FAFC] flex font-inter text-slate-900 overflow-hidden">
       {/* Consola Lateral */}
       <aside className="hidden lg:flex w-80 bg-slate-950 flex-col border-r border-slate-800 p-8 shrink-0">
         <div className="flex items-center gap-3 mb-10">
-          <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
-            <i className="fas fa-robot text-white text-xl"></i>
-          </div>
-          <h1 className="text-white font-black text-xl tracking-tighter uppercase">Orbidi <span className="text-indigo-400">SEO</span></h1>
+          <h1 className="text-white font-black text-2xl tracking-tight">
+            PLINNG GEO<span className="text-[#A4D62C] text-4xl leading-none">.</span>
+          </h1>
         </div>
 
         <div className="flex-1 flex flex-col min-h-0">
           <span className="text-[10px] uppercase font-black text-slate-500 tracking-widest mb-4 block">Monitor de Red</span>
           <div className="bg-black/50 rounded-2xl border border-slate-800 p-5 font-mono text-[9px] leading-relaxed flex-1 overflow-y-auto custom-scrollbar text-slate-400">
             {logs.map((log, i) => (
-              <div key={i} className="mb-2 border-l-2 border-indigo-500/20 pl-3">
+              <div key={i} className="mb-2 border-l-2 border-[#A4D62C]/20 pl-3">
                 {log}
               </div>
             ))}
@@ -1737,15 +2141,15 @@ Generate only the image.`;
           {step === AppStep.AUTH && (
             <div className="flex flex-col items-center justify-center min-h-[60vh] animate-slideUp">
               <div className="bg-white p-12 rounded-[3.5rem] shadow-2xl border border-slate-100 max-w-md w-full text-center">
-                <div className="w-16 h-16 bg-indigo-50 rounded-2xl flex items-center justify-center mx-auto mb-8 text-indigo-600">
+                <div className="w-16 h-16 bg-[#A4D62C]/10 rounded-2xl flex items-center justify-center mx-auto mb-8 text-[#A4D62C]">
                   <i className="fas fa-fingerprint text-2xl"></i>
                 </div>
                 <h2 className="text-2xl font-black mb-2">Acceso a Datos</h2>
-                <p className="text-slate-400 text-sm mb-10">Introduce tu Bearer Token de Orbidi</p>
+                <p className="text-slate-400 text-sm mb-10">Introduce tu Bearer Token de PLINNG</p>
                 <div className="space-y-6">
                   <input 
                     type="password" 
-                    className="w-full px-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-indigo-600 outline-none font-bold"
+                    className="w-full px-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-[#A4D62C] outline-none font-bold"
                     placeholder="Bearer eyJhbGci..."
                     value={authToken}
                     onChange={e => setAuthToken(e.target.value)}
@@ -1780,21 +2184,21 @@ Generate only the image.`;
 
                   <div className="bg-white p-10 rounded-[4rem] shadow-2xl border border-slate-100">
                     <h3 className="font-black text-slate-900 text-2xl mb-6 flex items-center gap-3">
-                      <i className="fas fa-link text-indigo-600"></i>
+                      <i className="fas fa-link text-[#A4D62C]"></i>
                       Enlaces Publicados
                     </h3>
                     
                     <div className="space-y-4">
                       {batchProgress.publishedUrls.map((url, idx) => (
-                        <div key={idx} className="flex items-center gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-200 hover:border-indigo-300 transition-all group">
-                          <div className="flex-shrink-0 w-10 h-10 bg-indigo-100 rounded-xl flex items-center justify-center">
-                            <span className="text-indigo-600 font-black text-lg">{idx + 1}</span>
+                        <div key={idx} className="flex items-center gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-200 hover:border-[#A4D62C]/50 transition-all group">
+                          <div className="flex-shrink-0 w-10 h-10 bg-[#A4D62C]/20 rounded-xl flex items-center justify-center">
+                            <span className="text-[#A4D62C] font-black text-lg">{idx + 1}</span>
                           </div>
                           <a 
                             href={url} 
                             target="_blank" 
                             rel="noopener noreferrer"
-                            className="flex-1 text-indigo-600 hover:text-indigo-800 text-base font-semibold truncate group-hover:underline"
+                            className="flex-1 text-[#A4D62C] hover:text-[#7A9E1F] text-base font-semibold truncate group-hover:underline"
                           >
                             {url}
                           </a>
@@ -1803,7 +2207,7 @@ Generate only the image.`;
                               navigator.clipboard.writeText(url);
                               addLog(`📋 URL copiada: ${url.slice(0, 50)}...`);
                             }}
-                            className="flex-shrink-0 text-slate-400 hover:text-indigo-600 transition-colors"
+                            className="flex-shrink-0 text-slate-400 hover:text-[#A4D62C] transition-colors"
                             title="Copiar URL"
                           >
                             <i className="fas fa-copy text-xl"></i>
@@ -1826,7 +2230,7 @@ Generate only the image.`;
                     <button 
                       onClick={updateClickUpTasks}
                       disabled={isLoading}
-                      className="flex-1 bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-black py-6 rounded-3xl hover:from-purple-700 hover:to-indigo-700 transition-all text-xl flex items-center justify-center gap-4 shadow-2xl"
+                      className="flex-1 bg-gradient-to-r from-[#7A9E1F] to-[#A4D62C] text-white font-black py-6 rounded-3xl hover:from-[#6A8E15] hover:to-[#8DB525] transition-all text-xl flex items-center justify-center gap-4 shadow-2xl"
                     >
                       {isLoading ? (
                         <>
@@ -1865,8 +2269,8 @@ Generate only the image.`;
                 /* Vista normal de selección de modo */
                 <>
               <div className="text-center mb-10">
-                <h2 className="text-4xl font-black tracking-tighter mb-3">Producción de Contenido SEO</h2>
-                <p className="text-slate-500 font-medium italic">"De brief a artículo publicado en minutos"</p>
+                <h2 className="text-4xl font-black tracking-tighter mb-2">PLINNG GEO<span className="text-[#A4D62C] text-5xl leading-none">.</span></h2>
+                <p className="text-slate-400 text-sm font-medium">Where SEO meets Generative Engines</p>
               </div>
 
               <div className="bg-white p-10 rounded-[4rem] shadow-2xl border border-slate-100 mb-8">
@@ -1874,13 +2278,13 @@ Generate only the image.`;
                 <div className="flex bg-slate-100 p-1.5 rounded-2xl mb-10">
                   <button 
                     onClick={() => setIsManualMode(false)} 
-                    className={`flex-1 py-3 rounded-xl font-black text-[10px] transition-all ${!isManualMode ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500'}`}
+                    className={`flex-1 py-3 rounded-xl font-black text-[10px] transition-all ${!isManualMode ? 'bg-white shadow-sm text-[#A4D62C]' : 'text-slate-500'}`}
                   >
                     EXTRACCIÓN AUTO
                   </button>
                   <button 
                     onClick={() => setIsManualMode(true)} 
-                    className={`flex-1 py-3 rounded-xl font-black text-[10px] transition-all ${isManualMode ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500'}`}
+                    className={`flex-1 py-3 rounded-xl font-black text-[10px] transition-all ${isManualMode ? 'bg-white shadow-sm text-[#A4D62C]' : 'text-slate-500'}`}
                   >
                     CARGA MASIVA CSV
                   </button>
@@ -1890,12 +2294,12 @@ Generate only the image.`;
                 {!isManualMode ? (
                   <div className="space-y-8">
                     <div>
-                      <label className="text-[10px] font-black uppercase text-indigo-500 mb-4 block tracking-widest">
+                      <label className="text-[10px] font-black uppercase text-[#A4D62C] mb-4 block tracking-widest">
                         UUID del Cliente (Account UUID)
                       </label>
                       <input 
                         type="text" 
-                        className="w-full px-8 py-5 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-indigo-600 outline-none font-black text-2xl text-center"
+                        className="w-full px-8 py-5 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-[#A4D62C] outline-none font-black text-2xl text-center"
                         placeholder="34ad9915-6fdc-4aed-81a9..."
                         value={accountUuid}
                         onChange={e => setAccountUuid(e.target.value)}
@@ -1904,7 +2308,7 @@ Generate only the image.`;
                     <button 
                       onClick={fetchBrief}
                       disabled={isLoading}
-                      className="w-full bg-indigo-600 text-white font-black py-6 rounded-3xl shadow-xl hover:bg-indigo-700 transition-all flex items-center justify-center gap-4 text-lg"
+                      className="w-full bg-[#A4D62C] text-white font-black py-6 rounded-3xl shadow-xl hover:bg-[#8DB525] transition-all flex items-center justify-center gap-4 text-lg"
                     >
                       {isLoading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-magic"></i>}
                       {isLoading ? 'Procesando...' : 'Generar 1 Artículo'}
@@ -1921,10 +2325,10 @@ Generate only the image.`;
                     {!isLoading && !batchProgress.isComplete && (
                       <>
                         <div>
-                          <label className="text-[10px] font-black uppercase text-indigo-500 mb-4 block tracking-widest">
+                          <label className="text-[10px] font-black uppercase text-[#A4D62C] mb-4 block tracking-widest">
                             Archivo CSV de Producción
                           </label>
-                          <div className="border-2 border-dashed border-slate-200 rounded-3xl p-8 text-center hover:border-indigo-400 transition-all bg-slate-50">
+                          <div className="border-2 border-dashed border-slate-200 rounded-3xl p-8 text-center hover:border-[#A4D62C]/70 transition-all bg-slate-50">
                             <i className="fas fa-file-csv text-5xl text-slate-300 mb-4"></i>
                             <input
                               type="file"
@@ -1937,7 +2341,7 @@ Generate only the image.`;
                               htmlFor="csv-upload" 
                               className="cursor-pointer block"
                             >
-                              <span className="text-indigo-600 font-black text-lg block mb-2">
+                              <span className="text-[#A4D62C] font-black text-lg block mb-2">
                                 {csvRows.length > 0 ? `✓ ${csvRows.length} filas cargadas` : 'Haz clic para cargar CSV'}
                               </span>
                               <span className="text-slate-400 text-[11px] block">
@@ -1948,32 +2352,32 @@ Generate only the image.`;
                         </div>
 
                         {csvRows.length > 0 && (
-                          <div className="bg-indigo-50 border-2 border-indigo-100 rounded-2xl p-6">
+                          <div className="bg-[#A4D62C]/10 border-2 border-[#A4D62C]/20 rounded-2xl p-6">
                             <div className="flex items-center justify-between mb-4">
                               <div>
                                 <p className="font-black text-indigo-900 text-lg">
                                   📊 {csvRows.length} cuentas detectadas
                                 </p>
-                                <p className="text-indigo-600 text-sm">
+                                <p className="text-[#A4D62C] text-sm">
                                   Total de artículos: {csvRows.reduce((sum, row) => sum + row.task_count, 0)}
                                 </p>
                               </div>
                               <button 
                                 onClick={() => { setCsvRows([]); setCurrentRowIndex(0); }}
-                                className="text-indigo-400 hover:text-indigo-600"
+                                className="text-[#A4D62C]/80 hover:text-[#A4D62C]"
                               >
                                 <i className="fas fa-times-circle text-2xl"></i>
                               </button>
                             </div>
-                            <div className="text-[10px] text-indigo-700 bg-white rounded-xl p-4 max-h-32 overflow-y-auto">
+                            <div className="text-[10px] text-[#7A9E1F] bg-white rounded-xl p-4 max-h-32 overflow-y-auto">
                               {csvRows.slice(0, 5).map((row, i) => (
-                                <div key={i} className="mb-2 border-b border-indigo-100 pb-2 last:border-0">
+                                <div key={i} className="mb-2 border-b border-[#A4D62C]/20 pb-2 last:border-0">
                                   <span className="font-black">Cuenta {i + 1}:</span> {row.account_uuid.slice(0, 20)}... 
-                                  <span className="ml-2 text-indigo-500">→ {row.task_count} artículos</span>
+                                  <span className="ml-2 text-[#A4D62C]">→ {row.task_count} artículos</span>
                                 </div>
                               ))}
                               {csvRows.length > 5 && (
-                                <div className="text-indigo-400 italic mt-2">
+                                <div className="text-[#A4D62C]/80 italic mt-2">
                                   + {csvRows.length - 5} cuentas más...
                                 </div>
                               )}
@@ -1986,7 +2390,7 @@ Generate only the image.`;
                           disabled={csvRows.length === 0}
                           className={`w-full font-black py-6 rounded-3xl shadow-xl transition-all text-lg flex items-center justify-center gap-4 ${
                             csvRows.length > 0
-                              ? 'bg-indigo-600 text-white hover:bg-indigo-700'
+                              ? 'bg-[#A4D62C] text-white hover:bg-[#8DB525]'
                               : 'bg-slate-200 text-slate-400 cursor-not-allowed'
                           }`}
                         >
@@ -1994,108 +2398,6 @@ Generate only the image.`;
                           Iniciar Producción Masiva
                         </button>
                       </>
-                    )}
-
-                    {/* Vista de progreso durante la producción */}
-                    {isLoading && !batchProgress.isComplete && (
-                      <div className="space-y-6">
-                        <div className="text-center">
-                          <div className="inline-block p-6 bg-indigo-100 rounded-full mb-4">
-                            <i className="fas fa-cog fa-spin text-4xl text-indigo-600"></i>
-                          </div>
-                          <h3 className="text-2xl font-black text-indigo-900 mb-2">
-                            Producción en curso...
-                          </h3>
-                          <p className="text-indigo-600 text-sm">
-                            Cuenta {batchProgress.currentAccount}/{batchProgress.totalAccounts} • 
-                            Artículo {batchProgress.currentArticle}/{batchProgress.totalArticles}
-                          </p>
-                        </div>
-
-                        <div className="bg-slate-50 rounded-2xl p-6">
-                          <div className="space-y-3">
-                            <div className="flex items-center justify-between text-sm">
-                              <span className="text-slate-600">Generando estructura...</span>
-                              <i className="fas fa-check-circle text-green-500"></i>
-                            </div>
-                            <div className="flex items-center justify-between text-sm">
-                              <span className="text-slate-600">Redactando contenido...</span>
-                              <i className="fas fa-spinner fa-spin text-indigo-500"></i>
-                            </div>
-                            <div className="flex items-center justify-between text-sm">
-                              <span className="text-slate-600">Generando imagen...</span>
-                              <i className="fas fa-circle text-slate-300"></i>
-                            </div>
-                            <div className="flex items-center justify-between text-sm">
-                              <span className="text-slate-600">Publicando...</span>
-                              <i className="fas fa-circle text-slate-300"></i>
-                            </div>
-                          </div>
-                        </div>
-
-                        <p className="text-center text-slate-400 text-xs">
-                          Por favor espera, esto puede tomar varios minutos...
-                        </p>
-                      </div>
-                    )}
-
-                    {/* Vista de resultados completados */}
-                    {batchProgress.isComplete && (
-                      <div className="space-y-6">
-                        <div className="text-center">
-                          <div className="inline-block p-6 bg-green-100 rounded-full mb-4">
-                            <i className="fas fa-check-circle text-4xl text-green-600"></i>
-                          </div>
-                          <h3 className="text-2xl font-black text-green-900 mb-2">
-                            ¡Producción completada!
-                          </h3>
-                          <p className="text-green-600 text-sm">
-                            {batchProgress.publishedUrls.length} artículos publicados exitosamente
-                          </p>
-                        </div>
-
-                        <div className="bg-slate-50 rounded-2xl p-6 space-y-3">
-                          <h4 className="font-black text-slate-700 text-sm mb-4">📋 Enlaces publicados:</h4>
-                          {batchProgress.publishedUrls.map((url, idx) => (
-                            <div key={idx} className="flex items-center gap-3 p-3 bg-white rounded-xl border border-slate-200">
-                              <div className="flex-shrink-0 w-8 h-8 bg-indigo-100 rounded-full flex items-center justify-center">
-                                <span className="text-indigo-600 font-black text-sm">{idx + 1}</span>
-                              </div>
-                              <a 
-                                href={url} 
-                                target="_blank" 
-                                rel="noopener noreferrer"
-                                className="flex-1 text-indigo-600 hover:text-indigo-800 text-sm font-medium truncate"
-                              >
-                                {url}
-                              </a>
-                              <button 
-                                onClick={() => {navigator.clipboard.writeText(url)}}
-                                className="flex-shrink-0 text-slate-400 hover:text-slate-600"
-                              >
-                                <i className="fas fa-copy"></i>
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-
-                        <button 
-                          onClick={() => {
-                            setBatchProgress({
-                              currentAccount: 0,
-                              totalAccounts: 0,
-                              currentArticle: 0,
-                              totalArticles: 0,
-                              publishedUrls: [],
-                              isComplete: false
-                            });
-                            setCsvRows([]);
-                          }}
-                          className="w-full bg-slate-600 text-white font-black py-4 rounded-2xl hover:bg-slate-700 transition-all"
-                        >
-                          Nueva Producción
-                        </button>
-                      </div>
                     )}
 
                     {!isLoading && !batchProgress.isComplete && csvRows.length === 0 && (
@@ -2122,8 +2424,8 @@ Generate only the image.`;
               <div className="bg-white p-12 rounded-[4rem] shadow-2xl border border-slate-100 mb-10">
                 <div className="flex flex-wrap gap-4 mb-12 min-h-[100px] content-start">
                   {keywords.map((kw, i) => (
-                    <div key={i} className="bg-indigo-50 px-6 py-4 rounded-2xl flex items-center gap-4 border border-indigo-100 hover:border-indigo-500 transition-all group">
-                      <span className="font-black text-indigo-700 text-lg">#{kw}</span>
+                    <div key={i} className="bg-[#A4D62C]/10 px-6 py-4 rounded-2xl flex items-center gap-4 border border-[#A4D62C]/20 hover:border-[#A4D62C] transition-all group">
+                      <span className="font-black text-[#7A9E1F] text-lg">#{kw}</span>
                       <button onClick={() => setKeywords(keywords.filter((_, idx) => idx !== i))} className="text-indigo-300 group-hover:text-rose-500 transition-colors">
                         <i className="fas fa-times-circle text-xl"></i>
                       </button>
@@ -2137,7 +2439,7 @@ Generate only the image.`;
                     <i className="fas fa-search absolute left-6 top-1/2 -translate-y-1/2 text-slate-400"></i>
                     <input 
                       type="text" 
-                      className="w-full px-14 py-5 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-indigo-600 outline-none font-bold text-lg"
+                      className="w-full px-14 py-5 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-[#A4D62C] outline-none font-bold text-lg"
                       placeholder="Añadir keyword personalizada..."
                       value={newKeyword}
                       onChange={e => setNewKeyword(e.target.value)}
@@ -2151,7 +2453,7 @@ Generate only the image.`;
                   </div>
                   <button 
                     onClick={() => { if(newKeyword.trim()) { setKeywords([...keywords, newKeyword.trim()]); setNewKeyword(''); } }} 
-                    className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-black text-[10px] uppercase tracking-widest hover:bg-indigo-600 transition-all shadow-lg"
+                    className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-black text-[10px] uppercase tracking-widest hover:bg-[#A4D62C] transition-all shadow-lg"
                   >
                     Añadir
                   </button>
@@ -2177,7 +2479,7 @@ Generate only the image.`;
                   }
                 }}
                 disabled={keywords.length === 0}
-                className={`w-full font-black py-8 rounded-[3rem] shadow-2xl transition-all text-2xl tracking-tight flex items-center justify-center gap-4 ${keywords.length > 0 ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
+                className={`w-full font-black py-8 rounded-[3rem] shadow-2xl transition-all text-2xl tracking-tight flex items-center justify-center gap-4 ${keywords.length > 0 ? 'bg-[#A4D62C] text-white hover:bg-[#8DB525]' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
               >
                 <i className="fas fa-layer-group"></i>
                 Generar Estructura H2
@@ -2190,18 +2492,18 @@ Generate only the image.`;
               <h2 className="text-3xl font-black text-slate-900 mb-10">Arquitectura de Contenidos</h2>
               <div className="bg-white p-14 rounded-[4.5rem] shadow-2xl border border-slate-100 mb-10 space-y-12">
                 <div>
-                  <label className="text-[10px] font-black text-indigo-500 uppercase tracking-widest block mb-4">H1 - Título Maestro</label>
+                  <label className="text-[10px] font-black text-[#A4D62C] uppercase tracking-widest block mb-4">H1 - Título Maestro</label>
                   <input 
-                    className="w-full text-4xl font-black text-slate-900 outline-none border-b-2 border-slate-50 focus:border-indigo-200 py-4 transition-all" 
+                    className="w-full text-4xl font-black text-slate-900 outline-none border-b-2 border-slate-50 focus:border-[#A4D62C]/30 py-4 transition-all" 
                     value={article.title || ''} 
                     onChange={e => setArticle({...article, title: e.target.value})} 
                   />
                 </div>
                 <div className="space-y-6">
-                  <label className="text-[10px] font-black text-indigo-500 uppercase tracking-widest block mb-4">H2 - Estructura de Secciones</label>
+                  <label className="text-[10px] font-black text-[#A4D62C] uppercase tracking-widest block mb-4">H2 - Estructura de Secciones</label>
                   {(article.sections || []).map((s, i) => (
                     <div key={i} className="flex items-center gap-8 p-8 bg-slate-50 rounded-[2.5rem] border border-slate-100 group hover:bg-white hover:shadow-xl transition-all">
-                      <div className="w-14 h-14 bg-indigo-600 text-white rounded-2xl flex items-center justify-center font-black text-2xl shadow-xl">{i+1}</div>
+                      <div className="w-14 h-14 bg-[#A4D62C] text-white rounded-2xl flex items-center justify-center font-black text-2xl shadow-xl">{i+1}</div>
                       <input 
                         className="flex-1 bg-transparent font-black text-2xl text-slate-700 outline-none" 
                         value={s.title || ''} 
@@ -2215,7 +2517,7 @@ Generate only the image.`;
                   ))}
                 </div>
               </div>
-              <button onClick={startWriting} className="w-full bg-indigo-600 text-white font-black py-8 rounded-[3rem] shadow-2xl hover:bg-indigo-700 transition-all text-2xl uppercase tracking-widest">Redactar Post Completo</button>
+              <button onClick={startWriting} className="w-full bg-[#A4D62C] text-white font-black py-8 rounded-[3rem] shadow-2xl hover:bg-[#8DB525] transition-all text-2xl uppercase tracking-widest">Redactar Post Completo</button>
             </div>
           )}
 
@@ -2252,7 +2554,7 @@ Generate only the image.`;
                       }
                     }}
                     disabled={isPublishing} 
-                    className="flex-1 md:flex-none bg-indigo-600 text-white px-10 py-5 rounded-[2rem] font-black text-[11px] shadow-2xl hover:bg-indigo-700 transition-all flex items-center justify-center gap-3 uppercase"
+                    className="flex-1 md:flex-none bg-[#A4D62C] text-white px-10 py-5 rounded-[2rem] font-black text-[11px] shadow-2xl hover:bg-[#8DB525] transition-all flex items-center justify-center gap-3 uppercase"
                   >
                     {isPublishing ? <i className="fas fa-spinner fa-spin"></i> : <i className="fab fa-wordpress text-lg"></i>}
                     Publicar con Imagen
@@ -2269,40 +2571,13 @@ Generate only the image.`;
                     <div className="flex-1">
                       <p className="font-black text-3xl text-slate-900">{publishResult.msg}</p>
                       {publishResult.url && (
-                        <a href={publishResult.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 text-indigo-600 font-black underline underline-offset-8 text-lg mt-4 group">
+                        <a href={publishResult.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 text-[#A4D62C] font-black underline underline-offset-8 text-lg mt-4 group">
                           Ver Artículo Publicado
                           <i className="fas fa-external-link-alt text-sm group-hover:translate-x-1 transition-transform"></i>
                         </a>
                       )}
                     </div>
                   </div>
-                  
-                  {/* Botón para continuar en modo CSV */}
-                  {publishResult.success && batchProgress.totalAccounts > 0 && (
-                    <button 
-                      onClick={continueToNextArticle}
-                      className="w-full bg-slate-900 text-white font-black py-6 rounded-3xl hover:bg-black transition-all text-lg flex items-center justify-center gap-3"
-                    >
-                      {batchProgress.currentArticle < batchProgress.totalArticles ? (
-                        <>
-                          <i className="fas fa-arrow-right"></i>
-                          Continuar con Artículo {batchProgress.currentArticle + 1}/{batchProgress.totalArticles}
-                        </>
-                      ) : (
-                        batchProgress.currentAccount < batchProgress.totalAccounts ? (
-                          <>
-                            <i className="fas fa-arrow-right"></i>
-                            Continuar con Cuenta {batchProgress.currentAccount + 1}/{batchProgress.totalAccounts}
-                          </>
-                        ) : (
-                          <>
-                            <i className="fas fa-check-double"></i>
-                            Ver Resumen Final
-                          </>
-                        )
-                      )}
-                    </button>
-                  )}
                 </div>
               )}
 
@@ -2338,15 +2613,15 @@ Generate only the image.`;
             <div className="fixed inset-0 bg-white/95 backdrop-blur-2xl z-[100] flex flex-col items-center justify-center animate-fadeIn">
               <div className="relative mb-14">
                 <div className="w-32 h-32 border-[10px] border-slate-100 rounded-full"></div>
-                <div className="w-32 h-32 border-[10px] border-indigo-600 border-t-transparent rounded-full animate-spin absolute inset-0"></div>
-                <div className="absolute inset-0 flex items-center justify-center text-indigo-600">
+                <div className="w-32 h-32 border-[10px] border-[#A4D62C] border-t-transparent rounded-full animate-spin absolute inset-0"></div>
+                <div className="absolute inset-0 flex items-center justify-center text-[#A4D62C]">
                   <i className={`fas ${isPublishing ? 'fa-cloud-upload-alt' : 'fa-brain'} text-4xl animate-pulse`}></i>
                 </div>
               </div>
               <h2 className="text-3xl font-black text-slate-900 mb-2 tracking-tight text-center">
                 {isPublishing ? "Conectando con WordPress" : "IA Procesando Contenido"}
               </h2>
-              <p className="text-indigo-600 font-black uppercase tracking-[0.4em] text-[10px] animate-pulse">{loadingStatus}</p>
+              <p className="text-[#A4D62C] font-black uppercase tracking-[0.4em] text-[10px] animate-pulse">{loadingStatus}</p>
             </div>
           )}
 
@@ -2360,7 +2635,7 @@ Generate only the image.`;
         .animate-fadeIn { animation: fadeIn 0.5s ease-out forwards; }
         .custom-scrollbar::-webkit-scrollbar { width: 5px; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
-        .content-style strong { font-weight: 900; color: #0f172a; background: rgba(99,102,241,0.08); padding: 0 4px; border-radius: 4px; }
+        .content-style strong { font-weight: 900; color: #0f172a; background: rgba(164,214,44,0.08); padding: 0 4px; border-radius: 4px; }
       `}</style>
     </div>
   );
