@@ -878,17 +878,19 @@ const App: React.FC = () => {
  
   // 🔑 FUNCIÓN BASE reutilizable (UI + CSV)
   const fetchBriefByUuid = async (uuid: string): Promise<string> => {
-    const ORBIDI_BEARER_TOKEN = import.meta.env.VITE_ORBIDI_BEARER_TOKEN;
+    const ORBIDI_API_KEY = import.meta.env.VITE_ORBIDI_API_KEY;
     
-    if (!uuid || !ORBIDI_BEARER_TOKEN) {
-      throw new Error("UUID o Bearer Token no disponible");
+    if (!uuid) {
+      throw new Error("UUID es requerido");
+    }
+    
+    if (!ORBIDI_API_KEY) {
+      throw new Error("VITE_ORBIDI_API_KEY no está configurado en el archivo .env");
     }
 
-    const authHeader = ORBIDI_BEARER_TOKEN.startsWith("Bearer ")
-      ? ORBIDI_BEARER_TOKEN
-      : `Bearer ${ORBIDI_BEARER_TOKEN}`;
-
-    const ORBIDI_API_KEY = import.meta.env.VITE_ORBIDI_API_KEY;
+    const authHeader = ORBIDI_API_KEY.startsWith("Bearer ")
+      ? ORBIDI_API_KEY
+      : `Bearer ${ORBIDI_API_KEY}`;
 
     const res = await fetch(
       `https://eu.api.orbidi.com/prod-line/space-management/accounts/${uuid}/brief`,
@@ -920,7 +922,7 @@ const App: React.FC = () => {
     }
 
     setIsLoading(true);
-    setLoadingStatus("Conectando con Orbidi...");
+    setLoadingStatus("Conectando con PLINNG...");
 
     try {
       const rawText = await fetchBriefByUuid(cleanUuid);
@@ -2053,14 +2055,14 @@ Generate only the image.`;
           addLog(`🎯 Prodline Task: ${taskId.slice(0, 8)}...`);
 
           try {
-            const PRODLINE_API_KEY = import.meta.env.VITE_PRODLINE_API_KEY;
+            const ORBIDI_API_KEY = import.meta.env.VITE_ORBIDI_API_KEY;
             
             const response = await fetch(
               `https://eu.api.orbidi.com/prod-line/task/task-management/tasks/${taskId}/properties`,
               {
                 method: 'POST',
                 headers: {
-                  'X-Api-Key': PRODLINE_API_KEY,
+                  'X-Api-Key': ORBIDI_API_KEY,
                   'Content-Type': 'application/json',
                   'Accept': 'application/json'
                 },
